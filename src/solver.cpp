@@ -796,16 +796,20 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
         }
 
+        // Update global dual bound from frontier
+        {
+            double new_bound = std::numeric_limits<double>::infinity();
+            double new_bound_raw = std::numeric_limits<double>::infinity();
+            for (const int idx : frontier) {
+                new_bound = std::min(new_bound, nodes[static_cast<size_t>(idx)].parent_dual_bound);
+                new_bound_raw = std::min(new_bound_raw, nodes[static_cast<size_t>(idx)].parent_dual_bound_raw);
+            }
+            if (std::isfinite(new_bound)) global_dual_bound = new_bound;
+            if (std::isfinite(new_bound_raw)) global_dual_bound_raw = new_bound_raw;
+        }
+
         // Stagnation control
         if (gap_stagnation_window > 0 && std::isfinite(best_obj)) {
-            const int refresh_interval = std::max(1, gap_stagnation_window / 5);
-            if (processed_nodes % refresh_interval == 0) {
-                double new_bound = std::numeric_limits<double>::infinity();
-                for (const int idx : frontier)
-                    new_bound = std::min(new_bound, nodes[static_cast<size_t>(idx)].parent_dual_bound);
-                if (std::isfinite(new_bound)) global_dual_bound = new_bound;
-            }
-
             const double current_gap = compute_mip_gap(best_obj, global_dual_bound);
             if (std::isfinite(current_gap) && current_gap < best_mip_gap_seen - 1e-8) {
                 best_mip_gap_seen = current_gap;
