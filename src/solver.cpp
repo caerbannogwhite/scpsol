@@ -570,6 +570,42 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     }
 
     // ================================================================
+    // Phase 6.6: Root Balas cover cuts
+    // ================================================================
+    int root_balas_cuts_added = 0;
+    if (config.balas_enabled && root_sol.solved && root_sol.optimal) {
+        LpSolution balas_sol = lp.solve();
+        ++total_lp_solves;
+        if (balas_sol.solved && balas_sol.optimal) {
+            auto rcosts = compute_reduced_costs(base.obj, balas_sol.row_dual, base, base.ncols);
+            auto br = balas_branch_generate(balas_sol.col_value, balas_sol.row_dual, rcosts,
+                                            base, base.ncols, config.balas_max_branches,
+                                            integ_tol, false);
+            if (!br.sets.empty()) {
+                std::vector<CutConstraint> balas_cuts;
+                for (const auto &R_k : br.sets) {
+                    CutConstraint cut;
+                    cut.indices.reserve(R_k.size());
+                    cut.values.reserve(R_k.size());
+                    for (const int j : R_k) {
+                        cut.indices.push_back(j);
+                        cut.values.push_back(1.0);
+                    }
+                    cut.rhs = 1.0;
+                    cut.type = ">=";
+                    balas_cuts.push_back(std::move(cut));
+                }
+                append_cuts_to_base_model(base, balas_cuts);
+                root_balas_cuts_added = static_cast<int>(balas_cuts.size());
+                lp.rebuild_model(base);
+                if (verbosity >= 2)
+                    fprintf(stderr, "  Root Balas cover cuts: %d added from %d sets\n",
+                            root_balas_cuts_added, static_cast<int>(br.sets.size()));
+            }
+        }
+    }
+
+    // ================================================================
     // Phase 6.7: Post-cut budget pruning
     // ================================================================
     if (std::isfinite(best_obj)) {
@@ -612,12 +648,16 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     double best_mip_gap_seen = std::numeric_limits<double>::infinity();
     int node_at_last_gap_improvement = 0;
 
-    int stagnation_response_phase = 0;
+    double cut_accumulator = 0.0;
+    double balas_accumulator = 0.0;
+    size_t frontier_at_last_stagnation = 0;
+    int frontier_shrink_streak = 0;
     bool force_aggressive_branching = false;
     auto cut_separators = make_cut_separators();
 
     const auto bnb_start = Clock::now();
     double next_log_sec = config.log_interval_seconds;
+    int log_event_count = 0;
 
     if (verbosity >= 2)
         fprintf(stderr, "Branch-and-bound started (max_nodes=%d)\n", config.max_nodes);
@@ -655,6 +695,12 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                             best_obj, global_dual_bound_raw);
                     if (std::isfinite(gap)) fprintf(stderr, "%.4f%%\n", gap * 100.0);
                     else fprintf(stderr, "inf\n");
+                    ++log_event_count;
+                    if (log_event_count % 10 == 0) {
+                        int total_cuts = base.nrows - nrows;
+                        fprintf(stderr, "    model: %d rows x %d cols, %d cuts\n",
+                                base.nrows, base.ncols, total_cuts);
+                    }
                 }
                 next_log_sec = std::chrono::duration<double>(now - bnb_start).count() + config.log_interval_seconds;
             }
@@ -817,9 +863,26 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
 
             if (processed_nodes - node_at_last_gap_improvement >= gap_stagnation_window) {
-                if (stagnation_response_phase == 0) {
-                    // Phase 0: mid-BnB cuts
-                    if (config.cuts_enabled && sol.optimal) {
+                node_at_last_gap_improvement = processed_nodes;
+
+                // Track frontier trend
+                bool frontier_shrinking = false;
+                if (frontier_at_last_stagnation > 0) {
+                    if (frontier.size() < frontier_at_last_stagnation)
+                        ++frontier_shrink_streak;
+                    else
+                        frontier_shrink_streak = 0;
+                    frontier_shrinking = (frontier_shrink_streak >= 2);
+                }
+                frontier_at_last_stagnation = frontier.size();
+
+                // Mid-BnB cuts (skip if frontier is naturally shrinking)
+                cut_accumulator += config.mid_bnb_cut_frequency;
+                if (cut_accumulator >= 1.0 && !frontier_shrinking &&
+                    config.cuts_enabled && sol.optimal) {
+                    cut_accumulator -= 1.0;
+                    int total_cuts = 0;
+                    for (int round = 0; round < config.mid_bnb_cut_rounds; ++round) {
                         std::vector<CutConstraint> round_cuts;
                         for (const auto &sep : cut_separators) {
                             auto sep_cuts = sep->separate(sol.col_value, sol.row_dual,
@@ -830,26 +893,33 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                             }
                             if (static_cast<int>(round_cuts.size()) >= config.max_cuts_per_round) break;
                         }
-                        if (!round_cuts.empty()) {
-                            append_cuts_to_base_model(base, round_cuts);
-                            root_cuts_added += static_cast<int>(round_cuts.size());
-                            lp.rebuild_model(base);
-                            if (verbosity >= 3)
-                                fprintf(stderr, "  Stagnation: added %d mid-BnB cuts\n",
-                                        static_cast<int>(round_cuts.size()));
-                        }
+                        if (round_cuts.empty()) break;
+                        append_cuts_to_base_model(base, round_cuts);
+                        total_cuts += static_cast<int>(round_cuts.size());
+                        // Re-solve to get updated solution for next round
+                        lp.rebuild_model(base);
+                        LpSolution cut_sol = lp.solve();
+                        ++total_lp_solves;
+                        if (!cut_sol.solved || !cut_sol.optimal) break;
+                        lp.save_basis();
+                        // Use updated solution for next separation round
+                        sol = cut_sol;
                     }
-                    stagnation_response_phase = 1;
-                } else {
-                    // Phase 1: force aggressive Balas
-                    if (config.balas_enabled) {
-                        force_aggressive_branching = true;
+                    if (total_cuts > 0) {
                         if (verbosity >= 3)
-                            fprintf(stderr, "  Stagnation: aggressive Balas branching\n");
+                            fprintf(stderr, "  Stagnation: added %d mid-BnB cuts (%d rounds)\n",
+                                    total_cuts, config.mid_bnb_cut_rounds);
                     }
-                    stagnation_response_phase = 0;
                 }
-                node_at_last_gap_improvement = processed_nodes;
+
+                // Aggressive Balas branching (independent of cuts)
+                balas_accumulator += config.aggressive_balas_frequency;
+                if (balas_accumulator >= 1.0 && config.balas_enabled) {
+                    balas_accumulator -= 1.0;
+                    force_aggressive_branching = true;
+                    if (verbosity >= 3)
+                        fprintf(stderr, "  Stagnation: aggressive Balas branching\n");
+                }
             }
         }
     }
