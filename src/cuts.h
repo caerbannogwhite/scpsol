@@ -14,7 +14,8 @@ public:
         const std::vector<double> &dual_solution,
         const BaseRelaxationModel &base,
         int ncols,
-        double tol) const = 0;
+        double tol,
+        double incumbent_bound) const = 0;
 };
 
 std::vector<std::unique_ptr<ICutSeparator>> make_cut_separators();

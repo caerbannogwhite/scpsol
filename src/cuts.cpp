@@ -1,4 +1,5 @@
 #include "cuts.h"
+#include "balas.h"
 
 #include <algorithm>
 #include <cmath>
@@ -36,7 +37,8 @@ public:
         const std::vector<double> &dual_solution,
         const BaseRelaxationModel &base,
         int ncols,
-        double tol) const override {
+        double tol,
+        double /*incumbent_bound*/) const override {
         std::vector<CutConstraint> cuts;
         if (static_cast<int>(dual_solution.size()) < base.nrows ||
             static_cast<int>(primal_solution.size()) < ncols)
@@ -87,7 +89,8 @@ public:
         const std::vector<double> &dual_solution,
         const BaseRelaxationModel &base,
         int ncols,
-        double tol) const override {
+        double tol,
+        double /*incumbent_bound*/) const override {
         std::vector<CutConstraint> cuts;
         if (static_cast<int>(dual_solution.size()) < base.nrows ||
             static_cast<int>(primal_solution.size()) < ncols)
@@ -161,7 +164,8 @@ public:
         const std::vector<double> &dual_solution,
         const BaseRelaxationModel &base,
         int ncols,
-        double tol) const override {
+        double tol,
+        double incumbent_bound) const override {
         std::vector<CutConstraint> cuts;
         if (static_cast<int>(dual_solution.size()) < base.nrows ||
             static_cast<int>(primal_solution.size()) < ncols)
@@ -170,6 +174,23 @@ public:
         std::vector<double> reduced_costs = compute_reduced_costs(
             base.obj, dual_solution, base, ncols);
 
+        // Try Algorithm 2 (BCG) first
+        CutConstraint bcg_cut = balas_cut_generate(
+            primal_solution, dual_solution, reduced_costs,
+            incumbent_bound, base, ncols, tol);
+
+        if (!bcg_cut.indices.empty()) {
+            // Check violation
+            double lhs_val = 0.0;
+            for (size_t k = 0; k < bcg_cut.indices.size(); ++k) {
+                lhs_val += primal_solution[static_cast<size_t>(bcg_cut.indices[k])];
+            }
+            if (lhs_val < bcg_cut.rhs - tol) {
+                cuts.push_back(std::move(bcg_cut));
+            }
+        }
+
+        // Fall back to per-row heuristic for additional cuts
         struct CutWithViolation { CutConstraint cut; double violation; };
         std::vector<CutWithViolation> candidates;
 
@@ -204,9 +225,7 @@ public:
                   });
 
         const size_t max_cuts = 50;
-        const size_t n_cuts = std::min(candidates.size(), max_cuts);
-        cuts.reserve(n_cuts);
-        for (size_t ci = 0; ci < n_cuts; ++ci) {
+        for (size_t ci = 0; ci < candidates.size() && cuts.size() < max_cuts; ++ci) {
             cuts.push_back(std::move(candidates[ci].cut));
         }
         return cuts;

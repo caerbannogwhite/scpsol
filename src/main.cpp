@@ -15,7 +15,7 @@ static void print_usage(const char *progname) {
             "  --verbosity N       Verbosity level (default 2)\n"
             "  --max-nodes N       Maximum BnB nodes (default 100000)\n"
             "  --time-limit S      Time limit in seconds (default 0 = unlimited)\n"
-            "  --cut-frequency F   Cut frequency 0.0-1.0 (default 0.3, 0=disable)\n"
+            "  --cut-frequency F   Cut frequency 0.0-1.0 (default 0.4, 0=disable)\n"
             "  --balas-frequency F Balas frequency 0.0-1.0 (default 0.2, 0=disable)\n"
             "  --cut-rounds N      Mid-BnB cut rounds per event (default 3)\n"
             "  --show-solution     Print selected columns\n"

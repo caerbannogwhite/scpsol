@@ -5,10 +5,20 @@
 
 namespace scpsol {
 
+CutConstraint balas_cut_generate(
+    const std::vector<double> &primal_solution,
+    const std::vector<double> &dual_solution,
+    const std::vector<double> &reduced_costs,
+    double incumbent_bound,
+    const BaseRelaxationModel &base,
+    int ncols,
+    double tol);
+
 BalasBranchResult balas_branch_generate(
     const std::vector<double> &primal_solution,
     const std::vector<double> &dual_solution,
     const std::vector<double> &reduced_costs,
+    double incumbent_bound,
     const BaseRelaxationModel &base,
     int ncols,
     int max_branches,

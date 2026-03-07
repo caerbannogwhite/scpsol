@@ -89,7 +89,7 @@ struct SolverConfig {
     int max_cuts_per_round = 100;
     int balas_max_branches = 20;
     int gap_stagnation_window = 50;
-    double mid_bnb_cut_frequency = 0.3;
+    double mid_bnb_cut_frequency = 0.4;
     double aggressive_balas_frequency = 0.2;
     int mid_bnb_cut_rounds = 3;
     int heuristic_frequency = 10;

@@ -502,6 +502,16 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         auto separators = make_cut_separators();
         LpSolution cut_sol = root_sol;
 
+        // Save pre-cut model state to restore if cuts don't help
+        const double pre_cut_tightened_dual = global_dual_bound;
+        const int pre_cut_nrows = base.nrows;
+        const int pre_cut_nnz = base.nnz;
+        const auto pre_cut_csr_inds = base.csr_inds;
+        const auto pre_cut_csr_offs = base.csr_offs;
+        const auto pre_cut_csr_vals = base.csr_vals;
+        const auto pre_cut_rhs = base.rhs;
+        const auto pre_cut_base_cuts = base.base_cuts;
+
         for (int round = 0; round < config.cut_rounds_root; ++round) {
             // Check integrality
             if (static_cast<int>(cut_sol.col_value.size()) >= base.ncols &&
@@ -538,7 +548,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             std::vector<CutConstraint> round_cuts;
             for (const auto &sep : separators) {
                 auto sep_cuts = sep->separate(cut_sol.col_value, cut_sol.row_dual,
-                                              base, base.ncols, integ_tol);
+                                              base, base.ncols, integ_tol, best_obj);
                 for (auto &c : sep_cuts) {
                     if (static_cast<int>(round_cuts.size()) >= config.max_cuts_per_round) break;
                     round_cuts.push_back(std::move(c));
@@ -565,8 +575,26 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             lp.save_basis();
         }
 
-        if (root_cuts_added > 0 && verbosity >= 2)
-            fprintf(stderr, "  Root cuts: %d total\n", root_cuts_added);
+        // Check if cuts actually improved the tightened dual bound.
+        // For integer objectives, cuts that don't push the LP past the next integer
+        // provide no benefit and can disrupt branching topology.
+        if (root_cuts_added > 0 && global_dual_bound <= pre_cut_tightened_dual + tol) {
+            // Cuts didn't improve the tightened bound — restore pre-cut model
+            base.nrows = pre_cut_nrows;
+            base.nnz = pre_cut_nnz;
+            base.csr_inds = pre_cut_csr_inds;
+            base.csr_offs = pre_cut_csr_offs;
+            base.csr_vals = pre_cut_csr_vals;
+            base.rhs = pre_cut_rhs;
+            base.base_cuts = pre_cut_base_cuts;
+            lp.rebuild_model(base);
+            root_cuts_added = 0;
+            if (verbosity >= 2)
+                fprintf(stderr, "  Root cuts undone: no tightened dual improvement\n");
+        } else if (root_cuts_added > 0 && verbosity >= 2) {
+            fprintf(stderr, "  Root cuts: %d total (dual %.12g -> %.12g)\n",
+                    root_cuts_added, pre_cut_tightened_dual, global_dual_bound);
+        }
     }
 
     // ================================================================
@@ -574,16 +602,25 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     // ================================================================
     int root_balas_cuts_added = 0;
     if (config.balas_enabled && root_sol.solved && root_sol.optimal) {
+        // Reuse existing LP solution (avoid unnecessary re-solve that perturbs basis)
         LpSolution balas_sol = lp.solve();
         ++total_lp_solves;
         if (balas_sol.solved && balas_sol.optimal) {
             auto rcosts = compute_reduced_costs(base.obj, balas_sol.row_dual, base, base.ncols);
             auto br = balas_branch_generate(balas_sol.col_value, balas_sol.row_dual, rcosts,
-                                            base, base.ncols, config.balas_max_branches,
+                                            best_obj, base, base.ncols, config.balas_max_branches,
                                             integ_tol, false);
             if (!br.sets.empty()) {
                 std::vector<CutConstraint> balas_cuts;
                 for (const auto &R_k : br.sets) {
+                    // Only add cover cuts that are violated by the LP
+                    double lhs_val = 0.0;
+                    for (const int j : R_k) {
+                        if (j >= 0 && j < base.ncols)
+                            lhs_val += balas_sol.col_value[static_cast<size_t>(j)];
+                    }
+                    if (lhs_val >= 1.0 - integ_tol) continue;
+
                     CutConstraint cut;
                     cut.indices.reserve(R_k.size());
                     cut.values.reserve(R_k.size());
@@ -595,12 +632,14 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     cut.type = ">=";
                     balas_cuts.push_back(std::move(cut));
                 }
-                append_cuts_to_base_model(base, balas_cuts);
-                root_balas_cuts_added = static_cast<int>(balas_cuts.size());
-                lp.rebuild_model(base);
-                if (verbosity >= 2)
-                    fprintf(stderr, "  Root Balas cover cuts: %d added from %d sets\n",
-                            root_balas_cuts_added, static_cast<int>(br.sets.size()));
+                if (!balas_cuts.empty()) {
+                    append_cuts_to_base_model(base, balas_cuts);
+                    root_balas_cuts_added = static_cast<int>(balas_cuts.size());
+                    lp.rebuild_model(base);
+                    if (verbosity >= 2)
+                        fprintf(stderr, "  Root Balas cover cuts: %d added (from %d sets)\n",
+                                root_balas_cuts_added, static_cast<int>(br.sets.size()));
+                }
             }
         }
     }
@@ -798,7 +837,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         if (config.balas_enabled) {
             auto rcosts = compute_reduced_costs(base.obj, sol.row_dual, base, base.ncols);
             auto br = balas_branch_generate(sol.col_value, sol.row_dual, rcosts,
-                                            base, base.ncols, config.balas_max_branches,
+                                            best_obj, base, base.ncols, config.balas_max_branches,
                                             integ_tol, force_aggressive_branching);
             if (br.use_br1) {
                 auto children = balas_br1_children(branch_node, br.sets, node_dual_bound, node_dual_bound_raw);
@@ -886,7 +925,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                         std::vector<CutConstraint> round_cuts;
                         for (const auto &sep : cut_separators) {
                             auto sep_cuts = sep->separate(sol.col_value, sol.row_dual,
-                                                          base, base.ncols, integ_tol);
+                                                          base, base.ncols, integ_tol, best_obj);
                             for (auto &c : sep_cuts) {
                                 if (static_cast<int>(round_cuts.size()) >= config.max_cuts_per_round) break;
                                 round_cuts.push_back(std::move(c));
