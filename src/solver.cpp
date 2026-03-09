@@ -802,9 +802,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 node_at_last_gap_improvement = processed_nodes;
                 prune_frontier(frontier, nodes, best_obj, tol, verbosity);
                 if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity) > 0)
-                    lp.rebuild_model(base);
+                    lp.rebuild_model_keep_basis(base);
                 if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity) > 0)
-                    lp.rebuild_model(base);
+                    lp.rebuild_model_keep_basis(base);
             }
         }
 
@@ -822,9 +822,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     fprintf(stderr, "  New incumbent: %.12g (exact)\n", best_obj);
                 prune_frontier(frontier, nodes, best_obj, tol, verbosity);
                 if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity) > 0)
-                    lp.rebuild_model(base);
+                    lp.rebuild_model_keep_basis(base);
                 if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity) > 0)
-                    lp.rebuild_model(base);
+                    lp.rebuild_model_keep_basis(base);
             }
             continue;
         }
@@ -834,11 +834,11 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         if (fractional.empty()) continue;
 
         bool used_balas = false;
-        if (config.balas_enabled) {
+        if (config.balas_enabled && force_aggressive_branching) {
             auto rcosts = compute_reduced_costs(base.obj, sol.row_dual, base, base.ncols);
             auto br = balas_branch_generate(sol.col_value, sol.row_dual, rcosts,
                                             best_obj, base, base.ncols, config.balas_max_branches,
-                                            integ_tol, force_aggressive_branching);
+                                            integ_tol, true);
             if (br.use_br1) {
                 auto children = balas_br1_children(branch_node, br.sets, node_dual_bound, node_dual_bound_raw);
                 int enqueued = 0;
@@ -850,12 +850,12 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     }
                 }
                 used_balas = (enqueued > 0);
-                if (force_aggressive_branching && verbosity >= 3) {
+                if (verbosity >= 3) {
                     fprintf(stderr, "  Aggressive BR1: %d children from %d sets\n",
                             enqueued, static_cast<int>(br.sets.size()));
-                    force_aggressive_branching = false;
                 }
             }
+            force_aggressive_branching = false;
         }
 
         if (!used_balas) {
@@ -920,6 +920,17 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 if (cut_accumulator >= 1.0 && !frontier_shrinking &&
                     config.cuts_enabled && sol.optimal) {
                     cut_accumulator -= 1.0;
+
+                    // Save pre-cut state for rollback
+                    const double pre_cut_dual = global_dual_bound;
+                    const int pre_cut_nrows = base.nrows;
+                    const int pre_cut_nnz = base.nnz;
+                    const auto pre_cut_csr_inds = base.csr_inds;
+                    const auto pre_cut_csr_offs = base.csr_offs;
+                    const auto pre_cut_csr_vals = base.csr_vals;
+                    const auto pre_cut_rhs = base.rhs;
+                    const auto pre_cut_base_cuts = base.base_cuts;
+
                     int total_cuts = 0;
                     for (int round = 0; round < config.mid_bnb_cut_rounds; ++round) {
                         std::vector<CutConstraint> round_cuts;
@@ -935,19 +946,43 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                         if (round_cuts.empty()) break;
                         append_cuts_to_base_model(base, round_cuts);
                         total_cuts += static_cast<int>(round_cuts.size());
-                        // Re-solve to get updated solution for next round
-                        lp.rebuild_model(base);
+                        // Use incremental add_cuts to preserve LP basis
+                        lp.restore_base_state();
+                        lp.add_cuts(round_cuts);
+                        lp.apply_decisions(branch_node.decisions);
                         LpSolution cut_sol = lp.solve();
                         ++total_lp_solves;
                         if (!cut_sol.solved || !cut_sol.optimal) break;
                         lp.save_basis();
-                        // Use updated solution for next separation round
                         sol = cut_sol;
                     }
+
                     if (total_cuts > 0) {
-                        if (verbosity >= 3)
-                            fprintf(stderr, "  Stagnation: added %d mid-BnB cuts (%d rounds)\n",
-                                    total_cuts, config.mid_bnb_cut_rounds);
+                        // Rebuild to sync base model with LP
+                        lp.rebuild_model(base);
+
+                        // Validate: check if cuts improved the tightened dual
+                        double post_cut_dual = sol.optimal ? sol.dual_obj : pre_cut_dual;
+                        if (obj_is_integral && std::isfinite(post_cut_dual))
+                            post_cut_dual = tighten_dual_bound(post_cut_dual, integ_tol);
+                        if (post_cut_dual <= pre_cut_dual + tol) {
+                            // Cuts didn't help — rollback
+                            base.nrows = pre_cut_nrows;
+                            base.nnz = pre_cut_nnz;
+                            base.csr_inds = pre_cut_csr_inds;
+                            base.csr_offs = pre_cut_csr_offs;
+                            base.csr_vals = pre_cut_csr_vals;
+                            base.rhs = pre_cut_rhs;
+                            base.base_cuts = pre_cut_base_cuts;
+                            lp.rebuild_model(base);
+                            if (verbosity >= 3)
+                                fprintf(stderr, "  Stagnation: %d mid-BnB cuts undone (no dual improvement)\n",
+                                        total_cuts);
+                        } else {
+                            if (verbosity >= 3)
+                                fprintf(stderr, "  Stagnation: added %d mid-BnB cuts (dual %.6g -> %.6g)\n",
+                                        total_cuts, pre_cut_dual, post_cut_dual);
+                        }
                     }
                 }
 
