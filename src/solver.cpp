@@ -352,6 +352,8 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     std::string incumbent_source = "none";
     double global_dual_bound = -std::numeric_limits<double>::infinity();
     double global_dual_bound_raw = -std::numeric_limits<double>::infinity();
+    double fixed_preprocess_cost = 0.0;
+    std::vector<int> fixed_original_cols;
 
     auto heuristics = make_integer_heuristics(config.heuristic_config);
 
@@ -388,8 +390,40 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                                   "cost_driven", tol, config.preprocess_time_limit, verbosity);
         apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                   config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
+        // Row reduction: essential columns, row domination, probing
+        auto rr = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
+                             tol, config.preprocess_time_limit, verbosity);
+        if (rr.cols_fixed > 0 || rr.rows_removed > 0) {
+            fixed_preprocess_cost += rr.fixed_cost;
+            for (int c : rr.fixed_original_cols) fixed_original_cols.push_back(c);
+            best_obj -= rr.fixed_cost;
+            if (verbosity >= 2)
+                fprintf(stderr, "  Row reduction: %d rows removed, %d cols fixed (cost %.6g)\n",
+                        rr.rows_removed, rr.cols_fixed, rr.fixed_cost);
+        }
         if (ncols < cols_before && verbosity >= 2)
-            fprintf(stderr, "  Pre-LP reduction: cols %d -> %d\n", cols_before, ncols);
+            fprintf(stderr, "  Pre-LP reduction: cols %d -> %d, rows %d\n", cols_before, ncols, nrows);
+    }
+
+    // Check if all rows are covered by essential columns
+    if (nrows == 0) {
+        const auto end_time = Clock::now();
+        result.wall_time = std::chrono::duration<double>(end_time - start_time).count();
+        result.primal_obj = fixed_preprocess_cost;
+        result.dual_obj = fixed_preprocess_cost;
+        result.mip_gap = 0.0;
+        result.nodes_processed = 0;
+        result.lp_solves = 0;
+        result.status = "Optimal";
+        result.solution.assign(static_cast<size_t>(ncols_input), 0.0);
+        for (int c : fixed_original_cols) {
+            if (c >= 0 && c < ncols_input)
+                result.solution[static_cast<size_t>(c)] = 1.0;
+        }
+        if (verbosity >= 1)
+            fprintf(stderr, "All rows covered by essential columns (cost %.12g)\n",
+                    fixed_preprocess_cost);
+        return result;
     }
 
     // ================================================================
@@ -467,14 +501,91 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         obj = base.obj; active_to_input = base.active_to_original;
         ncols = base.ncols;
 
+        // Reduced-cost fixing: remove columns with reduced cost > gap
+        if (root_sol.solved && root_sol.optimal && std::isfinite(best_obj)) {
+            const double gap = best_obj - root_sol.dual_obj;
+            if (gap > tol) {
+                auto rcosts = compute_reduced_costs(obj, root_sol.row_dual,
+                    base, std::min(ncols, static_cast<int>(root_sol.col_value.size())));
+                int rc_removed = 0;
+                std::vector<char> rc_active(static_cast<size_t>(ncols), 1);
+                for (int j = 0; j < ncols && j < static_cast<int>(rcosts.size()); ++j) {
+                    if (root_sol.col_value[static_cast<size_t>(j)] < tol &&
+                        rcosts[static_cast<size_t>(j)] > gap + tol) {
+                        rc_active[static_cast<size_t>(j)] = 0;
+                        ++rc_removed;
+                    }
+                }
+                if (rc_removed > 0) {
+                    // Rebuild without fixed columns
+                    std::vector<int> old_to_new(static_cast<size_t>(ncols), -1);
+                    std::vector<int> new_active_input;
+                    std::vector<double> new_obj_rc;
+                    int nc = 0;
+                    for (int j = 0; j < ncols; ++j) {
+                        if (rc_active[static_cast<size_t>(j)]) {
+                            old_to_new[static_cast<size_t>(j)] = nc;
+                            new_active_input.push_back(active_to_input[static_cast<size_t>(j)]);
+                            new_obj_rc.push_back(obj[static_cast<size_t>(j)]);
+                            ++nc;
+                        }
+                    }
+                    std::vector<int> new_inds_rc;
+                    std::vector<int> new_offs_rc;
+                    std::vector<double> new_vals_rc;
+                    new_offs_rc.push_back(0);
+                    for (int i = 0; i < nrows; ++i) {
+                        for (int k = csr_offs[static_cast<size_t>(i)];
+                             k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                            const int c = csr_inds[static_cast<size_t>(k)];
+                            if (c >= 0 && c < ncols) {
+                                const int m = old_to_new[static_cast<size_t>(c)];
+                                if (m >= 0) {
+                                    new_inds_rc.push_back(m);
+                                    new_vals_rc.push_back(csr_vals[static_cast<size_t>(k)]);
+                                }
+                            }
+                        }
+                        new_offs_rc.push_back(static_cast<int>(new_vals_rc.size()));
+                    }
+                    if (verbosity >= 3)
+                        fprintf(stderr, "  Reduced-cost fixing: %d cols removed, %d remaining\n",
+                                rc_removed, nc);
+                    ncols = nc;
+                    csr_inds = std::move(new_inds_rc);
+                    csr_offs = std::move(new_offs_rc);
+                    csr_vals = std::move(new_vals_rc);
+                    obj = std::move(new_obj_rc);
+                    active_to_input = std::move(new_active_input);
+                }
+            }
+        }
+
         apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                              best_obj, tol, verbosity);
         apply_budget_pruning_preprocess(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                         best_obj, tol, config.preprocess_time_limit, verbosity);
         apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                   config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
+        // Second round of row reduction after LP-based column removal
+        {
+            auto rr2 = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
+                                  tol, config.preprocess_time_limit, verbosity);
+            if (rr2.cols_fixed > 0 || rr2.rows_removed > 0) {
+                fixed_preprocess_cost += rr2.fixed_cost;
+                for (int c : rr2.fixed_original_cols) fixed_original_cols.push_back(c);
+                best_obj -= rr2.fixed_cost;
+                if (std::isfinite(global_dual_bound))
+                    global_dual_bound -= rr2.fixed_cost;
+                if (std::isfinite(global_dual_bound_raw))
+                    global_dual_bound_raw -= rr2.fixed_cost;
+                if (verbosity >= 2)
+                    fprintf(stderr, "  Post-LP row reduction: %d rows removed, %d cols fixed (cost %.6g)\n",
+                            rr2.rows_removed, rr2.cols_fixed, rr2.fixed_cost);
+            }
+        }
         if (ncols < cols_before && verbosity >= 2)
-            fprintf(stderr, "  Post-LP reduction: cols %d -> %d\n", cols_before, ncols);
+            fprintf(stderr, "  Post-LP reduction: cols %d -> %d, rows %d\n", cols_before, ncols, nrows);
     }
 
     // ================================================================
@@ -1019,6 +1130,21 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     result.wall_time = std::chrono::duration<double>(end_time - start_time).count();
     result.nodes_processed = processed_nodes;
     result.lp_solves = total_lp_solves;
+
+    // Add back the cost of columns fixed during preprocessing
+    best_obj += fixed_preprocess_cost;
+    global_dual_bound += fixed_preprocess_cost;
+    global_dual_bound_raw += fixed_preprocess_cost;
+
+    // Include fixed columns in the solution
+    if (!fixed_original_cols.empty()) {
+        if (best_solution.empty())
+            best_solution.assign(static_cast<size_t>(ncols_input), 0.0);
+        for (int c : fixed_original_cols) {
+            if (c >= 0 && c < ncols_input)
+                best_solution[static_cast<size_t>(c)] = 1.0;
+        }
+    }
 
     if (std::isfinite(best_obj)) {
         result.primal_obj = best_obj;
