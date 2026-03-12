@@ -406,6 +406,288 @@ public:
 
 } // anonymous namespace
 
+RowReductionResult row_reduce(
+    int &nrows, int &ncols,
+    std::vector<int> &csr_inds, std::vector<int> &csr_offs, std::vector<double> &csr_vals,
+    std::vector<double> &obj, std::vector<int> &active_to_input,
+    double tol, double time_limit_sec, int verbosity) {
+    RowReductionResult result;
+    if (nrows <= 0 || ncols <= 0) return result;
+
+    auto deadline = std::chrono::steady_clock::time_point::max();
+    if (time_limit_sec > 0.0) {
+        deadline = std::chrono::steady_clock::now() +
+                   std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                       std::chrono::duration<double>(time_limit_sec));
+    }
+
+    // Build adjacency
+    std::vector<std::vector<int>> cols_by_row(static_cast<size_t>(nrows));
+    std::vector<std::vector<int>> rows_by_col(static_cast<size_t>(ncols));
+    for (int i = 0; i < nrows; ++i) {
+        for (int k = csr_offs[static_cast<size_t>(i)];
+             k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+            const int col = csr_inds[static_cast<size_t>(k)];
+            if (col >= 0 && col < ncols && csr_vals[static_cast<size_t>(k)] > tol) {
+                cols_by_row[static_cast<size_t>(i)].push_back(col);
+                rows_by_col[static_cast<size_t>(col)].push_back(i);
+            }
+        }
+    }
+
+    std::vector<char> col_active(static_cast<size_t>(ncols), 1);
+    std::vector<char> row_active(static_cast<size_t>(nrows), 1);
+    std::vector<char> col_fixed(static_cast<size_t>(ncols), 0);
+
+    // ---- Phase 1: Essential column fixing (cascade) ----
+    // A row covered by exactly 1 active column forces that column to 1.
+    // Fixing a column removes all rows it covers, potentially creating new essentials.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < nrows; ++i) {
+            if (!row_active[static_cast<size_t>(i)]) continue;
+            int count = 0, last = -1;
+            for (int c : cols_by_row[static_cast<size_t>(i)]) {
+                if (col_active[static_cast<size_t>(c)]) {
+                    ++count; last = c;
+                    if (count > 1) break;
+                }
+            }
+            if (count == 1) {
+                col_fixed[static_cast<size_t>(last)] = 1;
+                col_active[static_cast<size_t>(last)] = 0;
+                result.fixed_cost += obj[static_cast<size_t>(last)];
+                result.fixed_original_cols.push_back(
+                    active_to_input[static_cast<size_t>(last)]);
+                ++result.cols_fixed;
+                for (int r : rows_by_col[static_cast<size_t>(last)]) {
+                    if (row_active[static_cast<size_t>(r)]) {
+                        row_active[static_cast<size_t>(r)] = 0;
+                        ++result.rows_removed;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Phase 2: Row domination ----
+    // If the active columns covering row A are a subset of those covering row B,
+    // then any solution satisfying A automatically satisfies B. Remove B.
+    // Sort rows by coverage size (ascending) so smaller sets are checked first.
+    std::vector<std::vector<int>> active_cols_sorted(static_cast<size_t>(nrows));
+    std::vector<int> row_order;
+    for (int i = 0; i < nrows; ++i) {
+        if (!row_active[static_cast<size_t>(i)]) continue;
+        for (int c : cols_by_row[static_cast<size_t>(i)]) {
+            if (col_active[static_cast<size_t>(c)])
+                active_cols_sorted[static_cast<size_t>(i)].push_back(c);
+        }
+        std::sort(active_cols_sorted[static_cast<size_t>(i)].begin(),
+                  active_cols_sorted[static_cast<size_t>(i)].end());
+        row_order.push_back(i);
+    }
+    std::sort(row_order.begin(), row_order.end(), [&](int a, int b) {
+        return active_cols_sorted[static_cast<size_t>(a)].size() <
+               active_cols_sorted[static_cast<size_t>(b)].size();
+    });
+
+    for (size_t ia = 0; ia < row_order.size(); ++ia) {
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        const int a = row_order[ia];
+        if (!row_active[static_cast<size_t>(a)]) continue;
+        const auto &cols_a = active_cols_sorted[static_cast<size_t>(a)];
+        for (size_t ib = ia + 1; ib < row_order.size(); ++ib) {
+            const int b = row_order[ib];
+            if (!row_active[static_cast<size_t>(b)]) continue;
+            const auto &cols_b = active_cols_sorted[static_cast<size_t>(b)];
+            if (cols_a.size() > cols_b.size()) continue;
+            if (isSubsetSorted(cols_a, cols_b)) {
+                row_active[static_cast<size_t>(b)] = 0;
+                ++result.rows_removed;
+            }
+        }
+    }
+
+    // ---- Phase 3: Probing ----
+    // For each active column j, simulate x_j = 0 and propagate forced fixings.
+    // If the cascade leads to an uncoverable row, x_j must be 1.
+    for (int j = 0; j < ncols; ++j) {
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        if (!col_active[static_cast<size_t>(j)]) continue;
+
+        // Skip columns that don't cover any active row
+        bool covers_active = false;
+        for (int r : rows_by_col[static_cast<size_t>(j)]) {
+            if (row_active[static_cast<size_t>(r)]) { covers_active = true; break; }
+        }
+        if (!covers_active) continue;
+
+        // Simulate x_j = 0 using rollback stack
+        struct Change { int idx; bool is_col; };
+        std::vector<Change> changes;
+        col_active[static_cast<size_t>(j)] = 0;
+        changes.push_back({j, true});
+
+        // Worklist: columns just deactivated whose covered rows need checking
+        std::vector<int> worklist;
+        worklist.push_back(j);
+        bool infeasible = false;
+
+        while (!worklist.empty() && !infeasible) {
+            const int deactivated = worklist.back();
+            worklist.pop_back();
+            for (int r : rows_by_col[static_cast<size_t>(deactivated)]) {
+                if (!row_active[static_cast<size_t>(r)]) continue;
+                int cnt = 0, last_c = -1;
+                for (int c : cols_by_row[static_cast<size_t>(r)]) {
+                    if (col_active[static_cast<size_t>(c)]) {
+                        ++cnt; last_c = c;
+                        if (cnt > 1) break;
+                    }
+                }
+                if (cnt == 0) { infeasible = true; break; }
+                if (cnt == 1) {
+                    // Force last_c to 1: remove its rows, deactivate it
+                    col_active[static_cast<size_t>(last_c)] = 0;
+                    changes.push_back({last_c, true});
+                    worklist.push_back(last_c);
+                    for (int rr : rows_by_col[static_cast<size_t>(last_c)]) {
+                        if (row_active[static_cast<size_t>(rr)]) {
+                            row_active[static_cast<size_t>(rr)] = 0;
+                            changes.push_back({rr, false});
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rollback all temporary changes
+        for (auto it = changes.rbegin(); it != changes.rend(); ++it) {
+            if (it->is_col) col_active[static_cast<size_t>(it->idx)] = 1;
+            else row_active[static_cast<size_t>(it->idx)] = 1;
+        }
+
+        if (infeasible) {
+            // x_j = 0 is infeasible → fix x_j = 1
+            col_fixed[static_cast<size_t>(j)] = 1;
+            col_active[static_cast<size_t>(j)] = 0;
+            result.fixed_cost += obj[static_cast<size_t>(j)];
+            result.fixed_original_cols.push_back(
+                active_to_input[static_cast<size_t>(j)]);
+            ++result.cols_fixed;
+            for (int r : rows_by_col[static_cast<size_t>(j)]) {
+                if (row_active[static_cast<size_t>(r)]) {
+                    row_active[static_cast<size_t>(r)] = 0;
+                    ++result.rows_removed;
+                }
+            }
+        }
+    }
+
+    // Re-run essential column cascade after probing fixings
+    changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < nrows; ++i) {
+            if (!row_active[static_cast<size_t>(i)]) continue;
+            int count = 0, last = -1;
+            for (int c : cols_by_row[static_cast<size_t>(i)]) {
+                if (col_active[static_cast<size_t>(c)]) {
+                    ++count; last = c;
+                    if (count > 1) break;
+                }
+            }
+            if (count == 1) {
+                col_fixed[static_cast<size_t>(last)] = 1;
+                col_active[static_cast<size_t>(last)] = 0;
+                result.fixed_cost += obj[static_cast<size_t>(last)];
+                result.fixed_original_cols.push_back(
+                    active_to_input[static_cast<size_t>(last)]);
+                ++result.cols_fixed;
+                for (int r : rows_by_col[static_cast<size_t>(last)]) {
+                    if (row_active[static_cast<size_t>(r)]) {
+                        row_active[static_cast<size_t>(r)] = 0;
+                        ++result.rows_removed;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove columns that only cover inactive rows (dead columns)
+    int dead_cols = 0;
+    for (int j2 = 0; j2 < ncols; ++j2) {
+        if (!col_active[static_cast<size_t>(j2)]) continue;
+        bool any = false;
+        for (int r : rows_by_col[static_cast<size_t>(j2)]) {
+            if (row_active[static_cast<size_t>(r)]) { any = true; break; }
+        }
+        if (!any) { col_active[static_cast<size_t>(j2)] = 0; ++dead_cols; }
+    }
+
+    if (result.rows_removed == 0 && result.cols_fixed == 0 && dead_cols == 0)
+        return result;
+
+    // Rebuild CSR with active rows and active columns
+    std::vector<int> old_col_to_new(static_cast<size_t>(ncols), -1);
+    std::vector<int> new_active;
+    int new_ncols = 0;
+    for (int j2 = 0; j2 < ncols; ++j2) {
+        if (col_active[static_cast<size_t>(j2)]) {
+            old_col_to_new[static_cast<size_t>(j2)] = new_ncols;
+            new_active.push_back(active_to_input[static_cast<size_t>(j2)]);
+            ++new_ncols;
+        }
+    }
+
+    std::vector<double> new_obj(static_cast<size_t>(new_ncols));
+    for (int j2 = 0; j2 < ncols; ++j2) {
+        const int nj = old_col_to_new[static_cast<size_t>(j2)];
+        if (nj >= 0) new_obj[static_cast<size_t>(nj)] = obj[static_cast<size_t>(j2)];
+    }
+
+    std::vector<int> new_inds, new_offs;
+    std::vector<double> new_vals;
+    new_offs.push_back(0);
+    int new_nrows = 0;
+    for (int i = 0; i < nrows; ++i) {
+        if (!row_active[static_cast<size_t>(i)]) continue;
+        for (int k = csr_offs[static_cast<size_t>(i)];
+             k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+            const int c = csr_inds[static_cast<size_t>(k)];
+            if (c >= 0 && c < ncols) {
+                const int nc = old_col_to_new[static_cast<size_t>(c)];
+                if (nc >= 0) {
+                    new_inds.push_back(nc);
+                    new_vals.push_back(csr_vals[static_cast<size_t>(k)]);
+                }
+            }
+        }
+        new_offs.push_back(static_cast<int>(new_vals.size()));
+        ++new_nrows;
+    }
+
+    if (verbosity >= 3) {
+        fprintf(stderr, "  Row reduction: %d rows, %d cols -> %d rows, %d cols "
+                        "(%d essential, %d dead, cost %.6g)\n",
+                nrows, ncols, new_nrows, new_ncols,
+                result.cols_fixed, dead_cols, result.fixed_cost);
+    }
+
+    nrows = new_nrows;
+    ncols = new_ncols;
+    csr_inds = std::move(new_inds);
+    csr_offs = std::move(new_offs);
+    csr_vals = std::move(new_vals);
+    obj = std::move(new_obj);
+    active_to_input = std::move(new_active);
+
+    return result;
+}
+
 std::vector<std::unique_ptr<IColumnPreprocessRule>>
 make_preprocess_rules(const std::string &configured) {
     std::vector<std::unique_ptr<IColumnPreprocessRule>> rules;

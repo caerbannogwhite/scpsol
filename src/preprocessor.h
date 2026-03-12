@@ -19,6 +19,19 @@ GreedySetCoverResult greedy_set_cover_heuristic(
     const std::vector<double> &csr_vals,
     const double *obj);
 
+struct RowReductionResult {
+    int rows_removed = 0;
+    int cols_fixed = 0;
+    double fixed_cost = 0.0;
+    std::vector<int> fixed_original_cols;
+};
+
+RowReductionResult row_reduce(
+    int &nrows, int &ncols,
+    std::vector<int> &csr_inds, std::vector<int> &csr_offs, std::vector<double> &csr_vals,
+    std::vector<double> &obj, std::vector<int> &active_to_input,
+    double tol, double time_limit_sec, int verbosity);
+
 class IColumnPreprocessRule {
 public:
     virtual ~IColumnPreprocessRule() {}

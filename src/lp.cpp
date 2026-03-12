@@ -166,4 +166,18 @@ void LpSolver::rebuild_model(const BaseRelaxationModel &base) {
     build_model(base);
 }
 
+void LpSolver::rebuild_model_keep_basis(const BaseRelaxationModel &base) {
+    HighsBasis basis;
+    bool had_basis = has_saved_basis_;
+    if (had_basis) basis = saved_basis_;
+    build_model(base);
+    if (had_basis) {
+        // Truncate or extend basis to match the new model dimensions
+        basis.col_status.resize(static_cast<size_t>(base.ncols), HighsBasisStatus::kNonbasic);
+        basis.row_status.resize(static_cast<size_t>(base.nrows), HighsBasisStatus::kNonbasic);
+        saved_basis_ = basis;
+        has_saved_basis_ = true;
+    }
+}
+
 } // namespace scpsol

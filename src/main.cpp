@@ -15,8 +15,9 @@ static void print_usage(const char *progname) {
             "  --verbosity N       Verbosity level (default 2)\n"
             "  --max-nodes N       Maximum BnB nodes (default 100000)\n"
             "  --time-limit S      Time limit in seconds (default 0 = unlimited)\n"
-            "  --no-cuts           Disable cutting planes\n"
-            "  --no-balas          Disable Balas branching\n"
+            "  --cut-frequency F   Cut frequency 0.0-1.0 (default 0.0, 0=disable)\n"
+            "  --balas-frequency F Balas frequency 0.0-1.0 (default 0.6, 0=disable)\n"
+            "  --cut-rounds N      Mid-BnB cut rounds per event (default 3)\n"
             "  --show-solution     Print selected columns\n"
             "  --preprocess RULES  Preprocess rules (default \"single,two\")\n",
             progname);
@@ -39,10 +40,12 @@ int main(int argc, char *argv[]) {
             config.max_nodes = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--time-limit") == 0 && i + 1 < argc) {
             config.time_limit_seconds = atof(argv[++i]);
-        } else if (strcmp(argv[i], "--no-cuts") == 0) {
-            config.cuts_enabled = false;
-        } else if (strcmp(argv[i], "--no-balas") == 0) {
-            config.balas_enabled = false;
+        } else if (strcmp(argv[i], "--cut-frequency") == 0 && i + 1 < argc) {
+            config.mid_bnb_cut_frequency = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--balas-frequency") == 0 && i + 1 < argc) {
+            config.aggressive_balas_frequency = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--cut-rounds") == 0 && i + 1 < argc) {
+            config.mid_bnb_cut_rounds = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--show-solution") == 0) {
             config.show_solution = true;
         } else if (strcmp(argv[i], "--preprocess") == 0 && i + 1 < argc) {
@@ -65,6 +68,10 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         return 1;
     }
+
+    // Derive enable flags from frequency parameters
+    config.cuts_enabled = (config.mid_bnb_cut_frequency > 0.0);
+    config.balas_enabled = (config.aggressive_balas_frequency > 0.0);
 
     try {
         scpsol::ScpInstance instance = scpsol::read_scp_file(input_file);

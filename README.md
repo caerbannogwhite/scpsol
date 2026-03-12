@@ -12,10 +12,21 @@ A Set Covering Problem (SCP) solver built from scratch in C++17, using [HiGHS](h
 
 ## Build
 
+### Linux / macOS (single-config generators)
+
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+### Windows (Visual Studio)
+
+```bash
+cmake -B build
+cmake --build build --config Release
+```
+
+The binary is placed in `build/Release/scpsol.exe`.
 
 HiGHS v1.9.0 is fetched automatically via CMake FetchContent.
 

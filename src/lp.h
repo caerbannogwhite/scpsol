@@ -16,6 +16,7 @@ public:
     void save_basis();
     void restore_basis();
     void rebuild_model(const BaseRelaxationModel &base);
+    void rebuild_model_keep_basis(const BaseRelaxationModel &base);
 
 private:
     Highs highs_;
