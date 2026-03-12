@@ -39,6 +39,7 @@ Full strong branching produces the smallest search trees among standard branchin
 Pseudocost branching avoids the cost of solving probe LPs by maintaining *historical statistics* of how much each variable's branching improved the dual bound in the past.
 
 For each variable $j$, we track:
+
 - **Down pseudocost** $\sigma^-_j$: average of $D^-_j / f_j$ over all previous down-branchings
 - **Up pseudocost** $\sigma^+_j$: average of $D^+_j / (1 - f_j)$ over all previous up-branchings
 
@@ -91,12 +92,14 @@ For SCP constraints of the form $\sum_{j \in S_i} x_j \geq 1$, when a variable i
 This propagation is implemented in `propagate_fixings()` (`src/reliability.cpp`), reusing the same essential-column cascade logic from the preprocessor but operating non-destructively on a temporary state.
 
 The benefits are twofold:
+
 - **Infeasibility detection without an LP solve**: if propagation proves infeasibility, the probe LP is skipped entirely, saving an expensive LP solve
 - **Tighter probe bounds**: implied fixings tighten the probe LP, producing more accurate dual bound gains for pseudocost estimation
 
 ### 3.3 Candidate Prioritization
 
 Not all fractional variables need probing. The implementation limits strong-branching probes to at most `max_sb` candidates per node (default 8). Candidates are sorted so that:
+
 1. **Unreliable** variables come first (they need probing most)
 2. Among equally unreliable variables, the **most fractional** (closest to 0.5) are probed first
 
