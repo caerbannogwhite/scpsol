@@ -5,6 +5,7 @@
 #include "heuristics.h"
 #include "lp.h"
 #include "preprocessor.h"
+#include "reliability.h"
 
 #include <algorithm>
 #include <chrono>
@@ -60,7 +61,8 @@ static int mid_bnb_column_removal(
     double tol,
     std::deque<int> &frontier,
     std::vector<BranchNodeState> &nodes,
-    int verbosity) {
+    int verbosity,
+    PseudocostState *pc_state = nullptr) {
     ModelReductionResult reduction = reduce_base_model(base, best_obj, tol);
     if (reduction.columns_removed <= 0) return 0;
     if (verbosity >= 3)
@@ -72,6 +74,7 @@ static int mid_bnb_column_removal(
             surviving.push_back(idx);
     }
     frontier.swap(surviving);
+    if (pc_state) pc_state->remap(reduction.old_to_new, base.ncols);
     return reduction.columns_removed;
 }
 
@@ -82,7 +85,8 @@ static int mid_bnb_budget_pruning(
     double preprocess_time_limit,
     std::deque<int> &frontier,
     std::vector<BranchNodeState> &nodes,
-    int verbosity) {
+    int verbosity,
+    PseudocostState *pc_state = nullptr) {
     ModelReductionResult reduction = reduce_base_model_budget_pruning(
         base, best_obj, tol, preprocess_time_limit);
     if (reduction.columns_removed <= 0) return 0;
@@ -95,6 +99,7 @@ static int mid_bnb_budget_pruning(
             surviving.push_back(idx);
     }
     frontier.swap(surviving);
+    if (pc_state) pc_state->remap(reduction.old_to_new, base.ncols);
     return reduction.columns_removed;
 }
 
@@ -772,7 +777,11 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     // ================================================================
     // BnB main loop
     // ================================================================
-    auto selector = make_branch_selector(config.branch_strategy);
+    const bool use_reliability = (config.branch_strategy == "reliability");
+    auto selector = make_branch_selector(
+        use_reliability ? "most_fractional" : config.branch_strategy);
+    PseudocostState pc_state;
+    pc_state.init(base.ncols);
 
     std::vector<BranchNodeState> nodes;
     {
@@ -912,9 +921,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             if (incumbent_improved) {
                 node_at_last_gap_improvement = processed_nodes;
                 prune_frontier(frontier, nodes, best_obj, tol, verbosity);
-                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity) > 0)
+                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0)
                     lp.rebuild_model_keep_basis(base);
-                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity) > 0)
+                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0)
                     lp.rebuild_model_keep_basis(base);
             }
         }
@@ -932,9 +941,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 if (verbosity >= 2)
                     fprintf(stderr, "  New incumbent: %.12g (exact)\n", best_obj);
                 prune_frontier(frontier, nodes, best_obj, tol, verbosity);
-                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity) > 0)
+                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0)
                     lp.rebuild_model_keep_basis(base);
-                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity) > 0)
+                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0)
                     lp.rebuild_model_keep_basis(base);
             }
             continue;
@@ -970,7 +979,17 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         }
 
         if (!used_balas) {
-            const int branch_var = selector->select(sol.col_value, base.obj, fractional);
+            int branch_var;
+            if (use_reliability) {
+                int sb_lps = 0;
+                branch_var = reliability_branch_select(
+                    pc_state, lp, base, branch_node, sol, fractional,
+                    best_obj, config.reliability_eta, config.reliability_max_sb,
+                    integ_tol, verbosity, sb_lps);
+                total_lp_solves += sb_lps;
+            } else {
+                branch_var = selector->select(sol.col_value, base.obj, fractional);
+            }
             if (branch_var < 0) continue;
 
             BranchNodeState child_zero;
