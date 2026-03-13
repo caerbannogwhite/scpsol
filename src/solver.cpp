@@ -51,7 +51,7 @@ static void prune_frontier(
     }
     frontier.swap(surviving);
     if (frontier.size() < before && verbosity >= 3) {
-        fprintf(stderr, "  Frontier pruned: %zu -> %zu nodes\n", before, frontier.size());
+        fprintf(stderr, "           Frontier pruned: %zu -> %zu nodes\n", before, frontier.size());
     }
 }
 
@@ -66,7 +66,7 @@ static int mid_bnb_column_removal(
     ModelReductionResult reduction = reduce_base_model(base, best_obj, tol);
     if (reduction.columns_removed <= 0) return 0;
     if (verbosity >= 3)
-        fprintf(stderr, "  Mid-BnB reduction: %d cols removed, %d remaining\n",
+        fprintf(stderr, "           Mid-BnB reduction: %d cols removed, %d remaining\n",
                 reduction.columns_removed, base.ncols);
     std::deque<int> surviving;
     for (const int idx : frontier) {
@@ -91,7 +91,7 @@ static int mid_bnb_budget_pruning(
         base, best_obj, tol, preprocess_time_limit);
     if (reduction.columns_removed <= 0) return 0;
     if (verbosity >= 3)
-        fprintf(stderr, "  Mid-BnB budget pruning: %d cols removed, %d remaining\n",
+        fprintf(stderr, "           Mid-BnB budget pruning: %d cols removed, %d remaining\n",
                 reduction.columns_removed, base.ncols);
     std::deque<int> surviving;
     for (const int idx : frontier) {
@@ -873,7 +873,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         if (config.time_limit_seconds > 0.0 && elapsed >= config.time_limit_seconds) {
             hard_time_limit_reached = true;
             if (verbosity >= 1)
-                fprintf(stderr, "BnB hard time limit reached (%.1fs)\n", elapsed);
+                fprintf(stderr, "  [%8.3fs] Time limit reached\n", elapsed);
             break;
         }
 
@@ -882,8 +882,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             const double gap = compute_mip_gap(best_obj, global_dual_bound);
             if (std::isfinite(gap) && gap <= config.mip_gap_tol) {
                 gap_tolerance_reached = true;
-                if (verbosity >= 1)
-                    fprintf(stderr, "MIP gap %.6f%% within tolerance; optimal\n", gap * 100.0);
+                if (verbosity >= 1) {
+                    const double t = std::chrono::duration<double>(now - start_time).count();
+                    fprintf(stderr, "  [%8.3fs] MIP gap %.8f%% within tolerance; optimal\n", t, gap * 100.0);
+                }
                 break;
             }
         }
@@ -894,15 +896,15 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             if (bnb_elapsed >= next_log_sec) {
                 if (verbosity >= 2) {
                     const double gap = compute_mip_gap(best_obj, global_dual_bound_raw);
-                    fprintf(stderr, "  nodes=%4d frontier=%4zu lp=%5d incumbent=%.12g dual=%.12g gap=",
-                            processed_nodes, frontier.size(), total_lp_solves,
+                    fprintf(stderr, "  [%8.3fs] nodes=%6d frontier=%6zu lp=%6d incumbent=%.8f dual=%.8f gap=",
+                            elapsed, processed_nodes, frontier.size(), total_lp_solves,
                             best_obj, global_dual_bound_raw);
-                    if (std::isfinite(gap)) fprintf(stderr, "%.4f%%\n", gap * 100.0);
+                    if (std::isfinite(gap)) fprintf(stderr, "%.8f%%\n", gap * 100.0);
                     else fprintf(stderr, "inf\n");
                     ++log_event_count;
                     if (log_event_count % 10 == 0) {
                         int total_cuts = base.nrows - nrows;
-                        fprintf(stderr, "    model: %d rows x %d cols, %d cuts\n",
+                        fprintf(stderr, "           model: %d rows x %d cols, %d cuts\n",
                                 base.nrows, base.ncols, total_cuts);
                     }
                 }
@@ -958,8 +960,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
                     incumbent_source = hr.name;
                     incumbent_improved = true;
-                    if (verbosity >= 2)
-                        fprintf(stderr, "  New incumbent: %.12g (from %s)\n", best_obj, hr.name.c_str());
+                    if (verbosity >= 2) {
+                        const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
+                        fprintf(stderr, "* [%8.3fs] New incumbent: %.8f (from %s)\n", t, best_obj, hr.name.c_str());
+                    }
                     break;
                 }
             }
@@ -983,8 +987,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 node_at_last_gap_improvement = processed_nodes;
                 adopt_incumbent_solution(best_solution, sol.col_value, base.ncols, ncols_input, base.active_to_original);
                 incumbent_source = "exact_node";
-                if (verbosity >= 2)
-                    fprintf(stderr, "  New incumbent: %.12g (exact)\n", best_obj);
+                if (verbosity >= 2) {
+                    const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
+                    fprintf(stderr, "* [%8.3fs] New incumbent: %.8f (exact)\n", t, best_obj);
+                }
                 prune_frontier(frontier, nodes, best_obj, tol, verbosity);
                 if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0)
                     lp.rebuild_model_keep_basis(base);
@@ -1016,8 +1022,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 }
                 used_balas = (enqueued > 0);
                 if (verbosity >= 3) {
-                    fprintf(stderr, "  Aggressive BR1: %d children from %d sets\n",
-                            enqueued, static_cast<int>(br.sets.size()));
+                    const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
+                    fprintf(stderr, "  [%8.3fs] Aggressive BR1: %d children from %d sets\n",
+                            t, enqueued, static_cast<int>(br.sets.size()));
                 }
             }
             force_aggressive_branching = false;
@@ -1150,13 +1157,17 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                             base.rhs = pre_cut_rhs;
                             base.base_cuts = pre_cut_base_cuts;
                             lp.rebuild_model(base);
-                            if (verbosity >= 3)
-                                fprintf(stderr, "  Stagnation: %d mid-BnB cuts undone (no dual improvement)\n",
-                                        total_cuts);
+                            if (verbosity >= 3) {
+                                const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
+                                fprintf(stderr, "  [%8.3fs] Stagnation: %d mid-BnB cuts undone (no dual improvement)\n",
+                                        t, total_cuts);
+                            }
                         } else {
-                            if (verbosity >= 3)
-                                fprintf(stderr, "  Stagnation: added %d mid-BnB cuts (dual %.6g -> %.6g)\n",
-                                        total_cuts, pre_cut_dual, post_cut_dual);
+                            if (verbosity >= 3) {
+                                const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
+                                fprintf(stderr, "  [%8.3fs] Stagnation: added %d mid-BnB cuts (dual %.8f -> %.8f)\n",
+                                        t, total_cuts, pre_cut_dual, post_cut_dual);
+                            }
                         }
                     }
                 }
@@ -1166,8 +1177,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 if (balas_accumulator >= 1.0 && config.balas_enabled) {
                     balas_accumulator -= 1.0;
                     force_aggressive_branching = true;
-                    if (verbosity >= 3)
-                        fprintf(stderr, "  Stagnation: aggressive Balas branching\n");
+                    if (verbosity >= 3) {
+                        const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
+                        fprintf(stderr, "  [%8.3fs] Stagnation: aggressive Balas branching\n", t);
+                    }
                 }
             }
         }
