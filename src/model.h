@@ -99,7 +99,9 @@ struct SolverConfig {
     double preprocess_time_limit = 10.0;
     bool show_solution = false;
     std::string preprocess_rules = "single,two";
-    std::string branch_strategy = "most_fractional";
+    std::string branch_strategy = "reliability";
+    int reliability_eta = 4;
+    int reliability_max_sb = 8;
     std::string heuristic_config = "";
     double log_interval_seconds = 5.0;
 };

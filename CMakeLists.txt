@@ -21,7 +21,8 @@ add_executable(scpsol
     src/heuristics.cpp
     src/cuts.cpp
     src/balas.cpp
-    src/bnb.cpp)
+    src/bnb.cpp
+    src/reliability.cpp)
 target_include_directories(scpsol PRIVATE src)
 target_link_libraries(scpsol PRIVATE highs)
 

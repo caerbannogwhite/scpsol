@@ -18,6 +18,9 @@ static void print_usage(const char *progname) {
             "  --cut-frequency F   Cut frequency 0.0-1.0 (default 0.0, 0=disable)\n"
             "  --balas-frequency F Balas frequency 0.0-1.0 (default 0.6, 0=disable)\n"
             "  --cut-rounds N      Mid-BnB cut rounds per event (default 3)\n"
+            "  --branch STRATEGY   Branch strategy: reliability, most_fractional, highest_cost (default reliability)\n"
+            "  --reliability-eta N Reliability parameter (default 4)\n"
+            "  --reliability-sb N  Max strong-branch probes per node (default 8)\n"
             "  --show-solution     Print selected columns\n"
             "  --preprocess RULES  Preprocess rules (default \"single,two\")\n",
             progname);
@@ -48,6 +51,12 @@ int main(int argc, char *argv[]) {
             config.mid_bnb_cut_rounds = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--show-solution") == 0) {
             config.show_solution = true;
+        } else if (strcmp(argv[i], "--branch") == 0 && i + 1 < argc) {
+            config.branch_strategy = argv[++i];
+        } else if (strcmp(argv[i], "--reliability-eta") == 0 && i + 1 < argc) {
+            config.reliability_eta = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--reliability-sb") == 0 && i + 1 < argc) {
+            config.reliability_max_sb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--preprocess") == 0 && i + 1 < argc) {
             config.preprocess_rules = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
