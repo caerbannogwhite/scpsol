@@ -383,10 +383,11 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     }
 
     // ================================================================
-    // Phase 2: Cost + budget + dominance reduction
+    // Phase 2: Cost + budget + dominance + row reduction (iterated)
     // ================================================================
     {
         const int cols_before = ncols;
+        // First round: run all preprocessors
         apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                              best_obj, tol, verbosity);
         apply_budget_pruning_preprocess(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
@@ -395,16 +396,36 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                                   "cost_driven", tol, config.preprocess_time_limit, verbosity);
         apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                   config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
-        // Row reduction: essential columns, row domination, probing
         auto rr = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                              tol, config.preprocess_time_limit, verbosity);
         if (rr.cols_fixed > 0 || rr.rows_removed > 0) {
             fixed_preprocess_cost += rr.fixed_cost;
             for (int c : rr.fixed_original_cols) fixed_original_cols.push_back(c);
             best_obj -= rr.fixed_cost;
-            if (verbosity >= 2)
-                fprintf(stderr, "  Row reduction: %d rows removed, %d cols fixed (cost %.6g)\n",
-                        rr.rows_removed, rr.cols_fixed, rr.fixed_cost);
+        }
+        // Iterate only if row reduction changed the model (new essentials/fixings
+        // may enable further dominance or cost reductions)
+        if (rr.cols_fixed > 0 || rr.rows_removed > 0) {
+            const int max_extra_rounds = 9;
+            for (int round = 0; round < max_extra_rounds; ++round) {
+                const int ncols_start = ncols;
+                const int nrows_start = nrows;
+                apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
+                                     best_obj, tol, verbosity);
+                apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
+                                          config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
+                auto rr2 = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
+                                      tol, config.preprocess_time_limit, verbosity);
+                if (rr2.cols_fixed > 0 || rr2.rows_removed > 0) {
+                    fixed_preprocess_cost += rr2.fixed_cost;
+                    for (int c : rr2.fixed_original_cols) fixed_original_cols.push_back(c);
+                    best_obj -= rr2.fixed_cost;
+                }
+                if (ncols == ncols_start && nrows == nrows_start) break;
+                if (verbosity >= 3)
+                    fprintf(stderr, "  Preprocess round %d: %d/%d -> %d/%d (cols/rows)\n",
+                            round + 2, ncols_start, nrows_start, ncols, nrows);
+            }
         }
         if (ncols < cols_before && verbosity >= 2)
             fprintf(stderr, "  Pre-LP reduction: cols %d -> %d, rows %d\n", cols_before, ncols, nrows);
@@ -566,13 +587,13 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
         }
 
+        // Post-LP reduction (first round)
         apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                              best_obj, tol, verbosity);
         apply_budget_pruning_preprocess(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                         best_obj, tol, config.preprocess_time_limit, verbosity);
         apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                   config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
-        // Second round of row reduction after LP-based column removal
         {
             auto rr2 = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                   tol, config.preprocess_time_limit, verbosity);
@@ -584,9 +605,33 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     global_dual_bound -= rr2.fixed_cost;
                 if (std::isfinite(global_dual_bound_raw))
                     global_dual_bound_raw -= rr2.fixed_cost;
-                if (verbosity >= 2)
-                    fprintf(stderr, "  Post-LP row reduction: %d rows removed, %d cols fixed (cost %.6g)\n",
-                            rr2.rows_removed, rr2.cols_fixed, rr2.fixed_cost);
+            }
+            // Iterate only if row reduction found something
+            if (rr2.cols_fixed > 0 || rr2.rows_removed > 0) {
+                const int max_extra_rounds = 9;
+                for (int round = 0; round < max_extra_rounds; ++round) {
+                    const int ncols_start = ncols;
+                    const int nrows_start = nrows;
+                    apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
+                                         best_obj, tol, verbosity);
+                    apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
+                                              config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
+                    auto rr3 = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
+                                          tol, config.preprocess_time_limit, verbosity);
+                    if (rr3.cols_fixed > 0 || rr3.rows_removed > 0) {
+                        fixed_preprocess_cost += rr3.fixed_cost;
+                        for (int c : rr3.fixed_original_cols) fixed_original_cols.push_back(c);
+                        best_obj -= rr3.fixed_cost;
+                        if (std::isfinite(global_dual_bound))
+                            global_dual_bound -= rr3.fixed_cost;
+                        if (std::isfinite(global_dual_bound_raw))
+                            global_dual_bound_raw -= rr3.fixed_cost;
+                    }
+                    if (ncols == ncols_start && nrows == nrows_start) break;
+                    if (verbosity >= 3)
+                        fprintf(stderr, "  Post-LP round %d: %d/%d -> %d/%d (cols/rows)\n",
+                                round + 2, ncols_start, nrows_start, ncols, nrows);
+                }
             }
         }
         if (ncols < cols_before && verbosity >= 2)
