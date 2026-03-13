@@ -40,7 +40,7 @@ def analyze(csvfile, top_n=15):
         n_timeout = 0
         n_correct = 0
         for e in entries:
-            t = float(e['time']) if e['time'] else 600
+            t = float(e['time']) if e['time'] else 300
             total_time += t
             total_nodes += int(e['nodes']) if e['nodes'] else 0
             gap = float(e['gap']) if e['gap'] else 100

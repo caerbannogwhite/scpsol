@@ -11,7 +11,7 @@
 
 SOLVER="build/Release/scpsol.exe"
 MODE="${1:-train}"
-TLIMIT="${2:-600}"
+TLIMIT="${2:-300}"
 PARALLEL="${3:-6}"
 
 if [ "$MODE" = "train" ]; then
