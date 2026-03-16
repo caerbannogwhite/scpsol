@@ -30,40 +30,59 @@ GreedySetCoverResult greedy_set_cover_heuristic(
         }
     }
 
-    struct ColEntry { double cost; int neg_coverage; int col_index; };
-    std::vector<ColEntry> columns(static_cast<size_t>(ncols));
-    for (int j = 0; j < ncols; ++j) {
-        columns[static_cast<size_t>(j)] = {
-            obj[j],
-            -static_cast<int>(rows_by_col[static_cast<size_t>(j)].size()),
-            j
-        };
-    }
-    std::sort(columns.begin(), columns.end(), [](const ColEntry &a, const ColEntry &b) {
-        if (a.cost != b.cost) return a.cost < b.cost;
-        return a.neg_coverage < b.neg_coverage;
-    });
-
+    // Chvátal cost-effectiveness greedy: at each step pick the column with
+    // the best (uncovered rows covered) / cost ratio.
+    // Maintains coverage counts incrementally for O(nnz) total update cost.
     std::vector<char> covered(static_cast<size_t>(nrows), 0);
+    std::vector<char> col_used(static_cast<size_t>(ncols), 0);
+    std::vector<int> cov_count(static_cast<size_t>(ncols));
+    for (int j = 0; j < ncols; ++j)
+        cov_count[static_cast<size_t>(j)] = static_cast<int>(rows_by_col[static_cast<size_t>(j)].size());
+
+    // Build columns_by_row for incremental updates
+    std::vector<std::vector<int>> cols_by_row(static_cast<size_t>(nrows));
+    for (int j = 0; j < ncols; ++j) {
+        for (int row : rows_by_col[static_cast<size_t>(j)])
+            cols_by_row[static_cast<size_t>(row)].push_back(j);
+    }
+
     int uncovered_count = nrows;
     double total_cost = 0.0;
 
-    for (const ColEntry &entry : columns) {
-        if (uncovered_count <= 0) break;
-        int new_coverage = 0;
-        for (int row : rows_by_col[static_cast<size_t>(entry.col_index)]) {
-            if (!covered[static_cast<size_t>(row)]) ++new_coverage;
+    while (uncovered_count > 0) {
+        int best_col = -1;
+        double best_ratio = -1.0;
+        int best_coverage = 0;
+
+        for (int j = 0; j < ncols; ++j) {
+            if (col_used[static_cast<size_t>(j)]) continue;
+            const int cov = cov_count[static_cast<size_t>(j)];
+            if (cov <= 0) continue;
+            const double cost_j = std::max(obj[j], 1e-12);
+            const double ratio = static_cast<double>(cov) / cost_j;
+            if (ratio > best_ratio ||
+                (ratio == best_ratio && cov > best_coverage)) {
+                best_ratio = ratio;
+                best_col = j;
+                best_coverage = cov;
+            }
         }
-        if (new_coverage > 0) {
-            for (int row : rows_by_col[static_cast<size_t>(entry.col_index)]) {
-                if (!covered[static_cast<size_t>(row)]) {
-                    covered[static_cast<size_t>(row)] = 1;
-                    --uncovered_count;
+
+        if (best_col < 0) break;
+
+        col_used[static_cast<size_t>(best_col)] = 1;
+        for (int row : rows_by_col[static_cast<size_t>(best_col)]) {
+            if (!covered[static_cast<size_t>(row)]) {
+                covered[static_cast<size_t>(row)] = 1;
+                --uncovered_count;
+                // Decrement coverage count for all columns covering this row
+                for (int k : cols_by_row[static_cast<size_t>(row)]) {
+                    --cov_count[static_cast<size_t>(k)];
                 }
             }
-            total_cost += entry.cost;
-            result.selected_columns.push_back(entry.col_index);
         }
+        total_cost += obj[best_col];
+        result.selected_columns.push_back(best_col);
     }
 
     if (uncovered_count == 0) {
