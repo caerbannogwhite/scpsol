@@ -1096,6 +1096,19 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             continue;
         }
 
+        // Node-level reduced cost fixing: fix variables that cannot improve
+        std::vector<BranchDecision> rc_fixings;
+        if (sol.optimal && std::isfinite(best_obj) && node_dual_bound < best_obj - tol) {
+            const double node_gap = best_obj - node_dual_bound;
+            auto rcosts = compute_reduced_costs(base.obj, sol.row_dual, base, base.ncols);
+            for (int j = 0; j < base.ncols; ++j) {
+                if (sol.col_value[static_cast<size_t>(j)] < integ_tol &&
+                    rcosts[static_cast<size_t>(j)] > node_gap + tol) {
+                    rc_fixings.push_back({j, 0});
+                }
+            }
+        }
+
         // Branch
         auto fractional = collect_fractional_candidates(sol.col_value, base.ncols, integ_tol);
         if (fractional.empty()) continue;
@@ -1145,21 +1158,27 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             if (branch_var < 0) continue;
 
             BranchNodeState child_zero;
-            if (append_decision_if_consistent(branch_node, branch_var, 0, &child_zero) &&
-                !is_node_provably_infeasible(child_zero, base)) {
-                child_zero.parent_dual_bound = node_dual_bound;
-                child_zero.parent_dual_bound_raw = node_dual_bound_raw;
-                nodes.push_back(child_zero);
-                frontier.push(static_cast<int>(nodes.size()) - 1);
+            if (append_decision_if_consistent(branch_node, branch_var, 0, &child_zero)) {
+                for (const auto &rc : rc_fixings)
+                    child_zero.decisions.push_back(rc);
+                if (!is_node_provably_infeasible(child_zero, base)) {
+                    child_zero.parent_dual_bound = node_dual_bound;
+                    child_zero.parent_dual_bound_raw = node_dual_bound_raw;
+                    nodes.push_back(std::move(child_zero));
+                    frontier.push(static_cast<int>(nodes.size()) - 1);
+                }
             }
 
             BranchNodeState child_one;
-            if (append_decision_if_consistent(branch_node, branch_var, 1, &child_one) &&
-                !is_node_provably_infeasible(child_one, base)) {
-                child_one.parent_dual_bound = node_dual_bound;
-                child_one.parent_dual_bound_raw = node_dual_bound_raw;
-                nodes.push_back(child_one);
-                frontier.push(static_cast<int>(nodes.size()) - 1);
+            if (append_decision_if_consistent(branch_node, branch_var, 1, &child_one)) {
+                for (const auto &rc : rc_fixings)
+                    child_one.decisions.push_back(rc);
+                if (!is_node_provably_infeasible(child_one, base)) {
+                    child_one.parent_dual_bound = node_dual_bound;
+                    child_one.parent_dual_bound_raw = node_dual_bound_raw;
+                    nodes.push_back(std::move(child_one));
+                    frontier.push(static_cast<int>(nodes.size()) - 1);
+                }
             }
         }
 
