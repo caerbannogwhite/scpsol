@@ -449,17 +449,86 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     // ================================================================
     // Phase 2: Cost + budget + dominance + row reduction (iterated)
     // ================================================================
+    // Helper: run Dominance Finder with CSR compaction
+    auto run_dominance_finder = [&]() {
+        if (ncols <= 0 || nrows <= 0) return;
+        ColumnPreprocessContext df_ctx;
+        df_ctx.nrows = nrows;
+        df_ctx.ncols = ncols;
+        df_ctx.costs.resize(static_cast<size_t>(ncols));
+        df_ctx.active.assign(static_cast<size_t>(ncols), 1);
+        df_ctx.rows_by_column.resize(static_cast<size_t>(ncols));
+        df_ctx.deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(static_cast<int>(config.preprocess_time_limit));
+
+        for (int j = 0; j < ncols; ++j)
+            df_ctx.costs[static_cast<size_t>(j)] = obj[static_cast<size_t>(j)];
+        for (int i = 0; i < nrows; ++i) {
+            for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                const int col = csr_inds[static_cast<size_t>(k)];
+                if (col >= 0 && col < ncols)
+                    df_ctx.rows_by_column[static_cast<size_t>(col)].push_back(i);
+            }
+        }
+
+        int df_removed = dominance_finder(df_ctx, tol, 0.5, verbosity);
+        if (df_removed > 0) {
+            std::vector<int> old_to_new(static_cast<size_t>(ncols), -1);
+            int new_idx = 0;
+            for (int j = 0; j < ncols; ++j) {
+                if (df_ctx.active[static_cast<size_t>(j)])
+                    old_to_new[static_cast<size_t>(j)] = new_idx++;
+            }
+            std::vector<double> new_obj;
+            std::vector<int> new_active;
+            for (int j = 0; j < ncols; ++j) {
+                if (df_ctx.active[static_cast<size_t>(j)]) {
+                    new_obj.push_back(obj[static_cast<size_t>(j)]);
+                    new_active.push_back(active_to_input[static_cast<size_t>(j)]);
+                }
+            }
+            std::vector<int> new_inds;
+            std::vector<int> new_offs = {0};
+            std::vector<double> new_vals;
+            for (int i = 0; i < nrows; ++i) {
+                for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                    const int old_col = csr_inds[static_cast<size_t>(k)];
+                    if (old_col >= 0 && old_col < ncols && old_to_new[static_cast<size_t>(old_col)] >= 0) {
+                        new_inds.push_back(old_to_new[static_cast<size_t>(old_col)]);
+                        new_vals.push_back(csr_vals[static_cast<size_t>(k)]);
+                    }
+                }
+                new_offs.push_back(static_cast<int>(new_inds.size()));
+            }
+            ncols = new_idx;
+            obj = std::move(new_obj);
+            active_to_input = std::move(new_active);
+            csr_inds = std::move(new_inds);
+            csr_offs = std::move(new_offs);
+            csr_vals = std::move(new_vals);
+            if (verbosity >= 2)
+                fprintf(stderr, "  Dominance Finder: %d cols removed, %d remaining\n", df_removed, ncols);
+        }
+    };
+
     {
         const int cols_before = ncols;
-        // First round: run all preprocessors
+        // Step 1: Cheap reductions (cost + budget)
         apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                              best_obj, tol, verbosity);
         apply_budget_pruning_preprocess(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                         best_obj, tol, config.preprocess_time_limit, verbosity);
+
+        // Step 2: Greedy multi-column dominance (fast, removes bulk of dominated cols)
+        run_dominance_finder();
+
+        // Step 3: Exact pairwise/triplet dominance on reduced set
         apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                   "cost_driven", tol, config.preprocess_time_limit, verbosity);
         apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                                   config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
+
+        // Step 4: Row reduction (essential columns, row domination, probing)
         auto rr = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
                              tol, config.preprocess_time_limit, verbosity);
         if (rr.cols_fixed > 0 || rr.rows_removed > 0) {
@@ -467,8 +536,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             for (int c : rr.fixed_original_cols) fixed_original_cols.push_back(c);
             best_obj -= rr.fixed_cost;
         }
-        // Iterate only if row reduction changed the model (new essentials/fixings
-        // may enable further dominance or cost reductions)
+        // Iterate if row reduction changed the model
         if (rr.cols_fixed > 0 || rr.rows_removed > 0) {
             const int max_extra_rounds = 9;
             for (int round = 0; round < max_extra_rounds; ++round) {
@@ -493,72 +561,6 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         }
         if (ncols < cols_before && verbosity >= 2)
             fprintf(stderr, "  Pre-LP reduction: cols %d -> %d, rows %d\n", cols_before, ncols, nrows);
-
-        // Dominance Finder: greedy multi-column dominance removal
-        if (ncols > 0 && nrows > 0) {
-            ColumnPreprocessContext df_ctx;
-            df_ctx.nrows = nrows;
-            df_ctx.ncols = ncols;
-            df_ctx.costs.resize(static_cast<size_t>(ncols));
-            df_ctx.active.assign(static_cast<size_t>(ncols), 1);
-            df_ctx.rows_by_column.resize(static_cast<size_t>(ncols));
-            df_ctx.deadline = std::chrono::steady_clock::now() +
-                std::chrono::seconds(static_cast<int>(config.preprocess_time_limit));
-
-            for (int j = 0; j < ncols; ++j)
-                df_ctx.costs[static_cast<size_t>(j)] = obj[static_cast<size_t>(j)];
-            // Build column-to-rows transpose from CSR in O(nnz)
-            for (int i = 0; i < nrows; ++i) {
-                for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                    const int col = csr_inds[static_cast<size_t>(k)];
-                    if (col >= 0 && col < ncols)
-                        df_ctx.rows_by_column[static_cast<size_t>(col)].push_back(i);
-                }
-            }
-
-            int df_removed = dominance_finder(df_ctx, tol, 0.5, verbosity);
-            if (df_removed > 0) {
-                // Apply removals
-                std::vector<int> old_to_new(static_cast<size_t>(ncols), -1);
-                int new_idx = 0;
-                for (int j = 0; j < ncols; ++j) {
-                    if (df_ctx.active[static_cast<size_t>(j)])
-                        old_to_new[static_cast<size_t>(j)] = new_idx++;
-                }
-                // Compact arrays
-                std::vector<double> new_obj;
-                std::vector<int> new_active;
-                for (int j = 0; j < ncols; ++j) {
-                    if (df_ctx.active[static_cast<size_t>(j)]) {
-                        new_obj.push_back(obj[static_cast<size_t>(j)]);
-                        new_active.push_back(active_to_input[static_cast<size_t>(j)]);
-                    }
-                }
-                // Remap CSR
-                std::vector<int> new_inds;
-                std::vector<int> new_offs = {0};
-                std::vector<double> new_vals;
-                for (int i = 0; i < nrows; ++i) {
-                    for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                        const int old_col = csr_inds[static_cast<size_t>(k)];
-                        if (old_col >= 0 && old_col < ncols && old_to_new[static_cast<size_t>(old_col)] >= 0) {
-                            new_inds.push_back(old_to_new[static_cast<size_t>(old_col)]);
-                            new_vals.push_back(csr_vals[static_cast<size_t>(k)]);
-                        }
-                    }
-                    new_offs.push_back(static_cast<int>(new_inds.size()));
-                }
-                ncols = new_idx;
-                obj = std::move(new_obj);
-                active_to_input = std::move(new_active);
-                csr_inds = std::move(new_inds);
-                csr_offs = std::move(new_offs);
-                csr_vals = std::move(new_vals);
-
-                if (verbosity >= 2)
-                    fprintf(stderr, "  Dominance Finder: %d cols removed, %d remaining\n", df_removed, ncols);
-            }
-        }
     }
 
     // Check if all rows are covered by essential columns
@@ -1180,11 +1182,18 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             continue;
         }
 
+        // Compute reduced costs once per node (used by RC fixing and Balas)
+        std::vector<double> rcosts;
+        const bool need_rcosts = sol.optimal &&
+            ((std::isfinite(best_obj) && node_dual_bound < best_obj - tol) ||
+             (config.balas_enabled && force_aggressive_branching));
+        if (need_rcosts)
+            rcosts = compute_reduced_costs(base.obj, sol.row_dual, base, base.ncols);
+
         // Node-level reduced cost fixing: fix variables that cannot improve
         std::vector<BranchDecision> rc_fixings;
-        if (sol.optimal && std::isfinite(best_obj) && node_dual_bound < best_obj - tol) {
+        if (!rcosts.empty() && std::isfinite(best_obj) && node_dual_bound < best_obj - tol) {
             const double node_gap = best_obj - node_dual_bound;
-            auto rcosts = compute_reduced_costs(base.obj, sol.row_dual, base, base.ncols);
             for (int j = 0; j < base.ncols; ++j) {
                 if (sol.col_value[static_cast<size_t>(j)] < integ_tol &&
                     rcosts[static_cast<size_t>(j)] > node_gap + tol) {
@@ -1198,8 +1207,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         if (fractional.empty()) continue;
 
         bool used_balas = false;
-        if (config.balas_enabled && force_aggressive_branching) {
-            auto rcosts = compute_reduced_costs(base.obj, sol.row_dual, base, base.ncols);
+        if (config.balas_enabled && force_aggressive_branching && !rcosts.empty()) {
             auto br = balas_branch_generate(sol.col_value, sol.row_dual, rcosts,
                                             best_obj, base, base.ncols, config.balas_max_branches,
                                             integ_tol, true);
