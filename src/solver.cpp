@@ -42,11 +42,17 @@ static void adopt_incumbent_solution(
 struct BestBoundFrontier {
     std::vector<int> heap;
     const std::vector<BranchNodeState> *nodes_ptr = nullptr;
+    double min_raw_bound = std::numeric_limits<double>::infinity();
 
     void init(const std::vector<BranchNodeState> *np) { nodes_ptr = np; }
 
     bool empty() const { return heap.empty(); }
     size_t size() const { return heap.size(); }
+
+    // Tightened dual bound of the best node (heap minimum)
+    double top_bound() const {
+        return (*nodes_ptr)[static_cast<size_t>(heap[0])].parent_dual_bound;
+    }
 
     bool cmp(int a, int b) const {
         return (*nodes_ptr)[static_cast<size_t>(a)].parent_dual_bound >
@@ -57,6 +63,8 @@ struct BestBoundFrontier {
         heap.push_back(idx);
         std::push_heap(heap.begin(), heap.end(),
             [this](int a, int b) { return cmp(a, b); });
+        const double raw = (*nodes_ptr)[static_cast<size_t>(idx)].parent_dual_bound_raw;
+        if (raw < min_raw_bound) min_raw_bound = raw;
     }
 
     int pop() {
@@ -72,9 +80,14 @@ struct BestBoundFrontier {
         size_t before = heap.size();
         std::vector<int> surviving;
         surviving.reserve(heap.size());
+        min_raw_bound = std::numeric_limits<double>::infinity();
         for (const int idx : heap) {
-            if ((*nodes_ptr)[static_cast<size_t>(idx)].parent_dual_bound < prune_bound)
+            const auto &nd = (*nodes_ptr)[static_cast<size_t>(idx)];
+            if (nd.parent_dual_bound < prune_bound) {
                 surviving.push_back(idx);
+                if (nd.parent_dual_bound_raw < min_raw_bound)
+                    min_raw_bound = nd.parent_dual_bound_raw;
+            }
         }
         heap = std::move(surviving);
         std::make_heap(heap.begin(), heap.end(),
@@ -87,6 +100,14 @@ struct BestBoundFrontier {
     void rebuild_heap() {
         std::make_heap(heap.begin(), heap.end(),
             [this](int a, int b) { return cmp(a, b); });
+    }
+
+    void recompute_min_raw() {
+        min_raw_bound = std::numeric_limits<double>::infinity();
+        for (const int idx : heap) {
+            const double raw = (*nodes_ptr)[static_cast<size_t>(idx)].parent_dual_bound_raw;
+            if (raw < min_raw_bound) min_raw_bound = raw;
+        }
     }
 };
 
@@ -110,6 +131,7 @@ static int mid_bnb_column_removal(
     }
     frontier.heap = std::move(surviving);
     frontier.rebuild_heap();
+    frontier.recompute_min_raw();
     if (pc_state) pc_state->remap(reduction.old_to_new, base.ncols);
     return reduction.columns_removed;
 }
@@ -136,6 +158,7 @@ static int mid_bnb_budget_pruning(
     }
     frontier.heap = std::move(surviving);
     frontier.rebuild_heap();
+    frontier.recompute_min_raw();
     if (pc_state) pc_state->remap(reduction.old_to_new, base.ncols);
     return reduction.columns_removed;
 }
@@ -962,11 +985,39 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         const int node_id = frontier.pop();
         const BranchNodeState branch_node = nodes[static_cast<size_t>(node_id)];
 
+        // Reclaim memory from processed node
+        {
+            auto &nd = nodes[static_cast<size_t>(node_id)];
+            nd.decisions.clear(); nd.decisions.shrink_to_fit();
+            nd.cuts.clear(); nd.cuts.shrink_to_fit();
+        }
+
         // Bound check
         if (branch_node.parent_dual_bound >= best_obj - tol) continue;
 
+        // Node-level propagation: detect infeasibility and find implied fixings.
+        // Only worthwhile when enough variables are fixed to create essential columns.
+        const bool do_propagation = (static_cast<int>(branch_node.decisions.size()) >= 3);
+        std::vector<BranchDecision> augmented_decisions;
+        if (do_propagation) {
+            if (!adj_valid) {
+                cached_adj = build_adjacency(base);
+                adj_valid = true;
+            }
+            auto prop = propagate_fixings(cached_adj, branch_node.decisions, -1, 0);
+            if (prop.infeasible) {
+                ++processed_nodes;
+                continue;
+            }
+            if (!prop.implied.empty()) {
+                augmented_decisions = branch_node.decisions;
+                for (const auto &imp : prop.implied)
+                    augmented_decisions.push_back(imp);
+            }
+        }
+
         // Solve LP
-        lp.apply_decisions(branch_node.decisions);
+        lp.apply_decisions(augmented_decisions.empty() ? branch_node.decisions : augmented_decisions);
         lp.add_cuts(branch_node.cuts);
         lp.restore_basis();
         LpSolution sol = lp.solve();
@@ -1112,17 +1163,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
         }
 
-        // Update global dual bound from frontier
-        // With best-bound ordering, the top of the heap has the minimum bound
-        {
-            double new_bound = std::numeric_limits<double>::infinity();
-            double new_bound_raw = std::numeric_limits<double>::infinity();
-            for (const int idx : frontier.heap) {
-                new_bound = std::min(new_bound, nodes[static_cast<size_t>(idx)].parent_dual_bound);
-                new_bound_raw = std::min(new_bound_raw, nodes[static_cast<size_t>(idx)].parent_dual_bound_raw);
-            }
-            if (std::isfinite(new_bound)) global_dual_bound = new_bound;
-            if (std::isfinite(new_bound_raw)) global_dual_bound_raw = new_bound_raw;
+        // Update global dual bound from heap top: O(1) instead of O(|frontier|)
+        if (!frontier.empty()) {
+            global_dual_bound = frontier.top_bound();
+            global_dual_bound_raw = frontier.min_raw_bound;
         }
 
         // Stagnation control
