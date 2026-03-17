@@ -73,6 +73,10 @@ struct BestBoundFrontier {
             [this](int a, int b) { return cmp(a, b); });
         int idx = heap.back();
         heap.pop_back();
+        // If the popped node held the minimum raw bound, recompute
+        const double popped_raw = (*nodes_ptr)[static_cast<size_t>(idx)].parent_dual_bound_raw;
+        if (popped_raw <= min_raw_bound + 1e-12)
+            recompute_min_raw();
         return idx;
     }
 
