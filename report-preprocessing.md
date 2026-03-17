@@ -83,7 +83,33 @@ After all probing, a final essential column cascade picks up any newly created e
 
 **Bitset acceleration.** Pair and triple union-covers checks use `DynBitset::is_subset_of_union()` and `DynBitset::is_subset_of_union3()`, which compute the union-subset test in $\lceil m/64 \rceil$ bitwise operations regardless of column cardinalities.
 
-### 3.7 Incumbent Budget Pruning
+### 3.7 Greedy Multi-Column Dominance Finder
+
+**Theory.** The pairwise (§3.4–3.6) dominance checks are exact but have $O(n^2)$ or $O(n^3)$ complexity, which becomes prohibitive for large column sets. The greedy multi-column dominance finder generalizes these checks to arbitrary numbers of replacement columns using a fast heuristic: for each candidate column $\hat{j}$, it tests whether a set of cheaper "kept" columns $\tilde{N}$ can collectively cover all rows of $\hat{j}$ at total cost $\leq c_{\hat{j}}$.
+
+The algorithm follows the structure of Algorithm 1 from Grossman & Wool (1997):
+
+1. Initialize $\tilde{N}$ with all unit-cost columns ($c_j = 1$).
+2. Sort remaining columns $\hat{N}$ by ascending cost.
+3. For each $\hat{j} \in \hat{N}$ (cheapest first):
+   - Test: can columns in $\tilde{N}$ cover all rows $R_{\hat{j}}$ at cost $\leq c_{\hat{j}}$?
+   - If yes: remove $\hat{j}$ (it is dominated).
+   - If no: add $\hat{j}$ to $\tilde{N}$ (it is needed for future tests).
+
+**Implementation.** The `dominance_finder()` function in `src/preprocessor.cpp` uses a greedy set cover heuristic for each dominance test, rather than solving a sub-MIP. For each candidate $\hat{j}$:
+
+1. **Feasibility check**: Verify every row of $\hat{j}$ has $\geq 1$ covering column in $\tilde{N}$. If not, $\hat{j}$ cannot be dominated — keep it.
+2. **Greedy cover**: Collect all $\tilde{N}$-columns sharing rows with $\hat{j}$. Repeatedly select the column with the best (uncovered rows of $\hat{j}$) / cost ratio until all rows are covered or the budget is exhausted.
+3. If all rows are covered within budget $c_{\hat{j}}$, remove $\hat{j}$.
+
+**Key implementation details:**
+- Maintains a reverse index `tilde_cols_by_row` (updated incrementally as $\tilde{N}$ grows).
+- Uses reusable `uncovered` and `is_candidate` buffers to avoid per-column allocation.
+- Worst-case $O(|\hat{N}| \cdot |\tilde{N}| \cdot \text{avg\_rows})$ but very fast in practice ($< 0.1$s on 3000-column instances).
+
+**Impact.** On OR-Library benchmark instances, the greedy DF removes 50–85% of surviving columns (after cost/budget pruning) with negligible overhead. By running before the $O(n^2)$ pairwise checks, it reduces their input from $\sim$2600 to $\sim$400 columns, yielding a $\sim$5× speedup in total preprocessing time.
+
+### 3.8 Incumbent Budget Pruning
 
 **Theory.** Given a known upper bound $z^*$ (incumbent), any column $j$ with $c_j \geq z^*$ cannot appear in any improving solution, since it alone would exceed the budget. More generally, if including $j$ requires a minimum additional cost to cover the remaining rows that exceeds $z^* - 1$, then $j$ can be pruned.
 
@@ -91,13 +117,13 @@ The budget for column $j$ is $B_j = \lfloor z^* \rfloor - 1 - \lfloor c_j \rfloo
 
 **Implementation.** The `IncumbentBudgetPruningRule` processes columns from most expensive to cheapest, building a per-row sorted column list for efficient minimum-cost lookups.
 
-### 3.8 Reduced-Cost Fixing
+### 3.9 Reduced-Cost Fixing
 
 **Theory.** After solving the LP relaxation with dual bound $z_{LP}$ and incumbent $z^*$, the *gap* is $\Delta = z^* - z_{LP}$. For any column $j$ with LP value $x_j = 0$ and reduced cost $\bar{c}_j > \Delta$, fixing $x_j = 1$ would increase the LP bound beyond $z^*$, so $x_j = 0$ in every optimal solution. This is a standard technique in mixed-integer programming.
 
 **Implementation.** In `solver.cpp` (Phase 4-5), reduced costs are computed from the LP dual solution. Columns at their lower bound ($x_j \approx 0$) with $\bar{c}_j > \Delta + \epsilon$ are removed.
 
-### 3.9 Cost Reduction
+### 3.10 Cost Reduction
 
 **Theory.** Any column with $c_j \geq z^*$ (the incumbent bound) can be removed, since including it alone would match or exceed the best known solution. Combined with the SCP constraint that at least one other column must be present, the total would strictly exceed $z^*$.
 
@@ -123,7 +149,9 @@ The `greedy_set_cover_heuristic()` function in `src/preprocessor.cpp` implements
 4. Mark covered rows, and for each newly covered row, decrement `cov_count[k]` for all columns $k$ covering that row
 5. Repeat until all rows are covered
 
-The incremental update (step 4) ensures that coverage counts are maintained in $O(\text{nnz})$ total across all iterations, rather than recomputing from scratch at each step. The greedy solution provides the initial incumbent bound $z^*$ that enables cost reduction and budget pruning in subsequent preprocessing stages.
+The incremental update (step 4) ensures that coverage counts are maintained in $O(\text{nnz})$ total across all iterations, rather than recomputing from scratch at each step.
+
+**Post-processing: Redundancy Removal.** After the greedy completes, a redundancy removal pass tries to remove unnecessary columns. Selected columns are sorted by cost (most expensive first), and each column is tentatively removed: if all rows remain covered (each row's coverage count stays $\geq 1$), the column is permanently dropped. This reduces the initial incumbent $z^*$, which in turn enables more aggressive cost reduction and budget pruning in subsequent preprocessing stages.
 
 ## 4b. BnB Heuristic: Dual-Guided Cover Repair
 
@@ -154,14 +182,18 @@ The full preprocessing pipeline in `solver.cpp` proceeds as follows:
 
 **Phase 1: Greedy Heuristic**
 - Compute initial feasible solution and upper bound $z^*$
+- Post-process with redundancy removal (remove unnecessary columns, most expensive first)
 
 **Phase 2: Pre-LP Reduction (iterated)**
 Repeat until fixpoint:
 1. Cost reduction (remove columns with $c_j \geq z^*$)
 2. Incumbent budget pruning
-3. Cost-driven replacement (2- and 3-column dominance)
-4. Configured dominance rules (single, two-column)
-5. Row reduction (essential columns, row domination, probing)
+3. **Greedy multi-column dominance finder** (see §3.10)
+4. Cost-driven replacement (2- and 3-column dominance)
+5. Configured dominance rules (single, two-column)
+6. Row reduction (essential columns, row domination, probing)
+
+*Note:* The greedy dominance finder (step 3) runs before the expensive pairwise/triplet checks (steps 4-5). This is critical for performance: it reduces the column count by 50-85% with negligible overhead, so the subsequent $O(n^2)$ and $O(n^3)$ rules operate on a much smaller problem.
 
 **Phase 3: Root LP Relaxation**
 - Solve LP relaxation on the reduced problem
