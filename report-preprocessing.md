@@ -42,7 +42,7 @@ The fixed columns' costs are accumulated in `fixed_preprocess_cost` and subtract
 
 **Theory.** Row $i$ *dominates* row $i'$ if every column covering $i$ also covers $i'$, i.e., $S_i \subseteq S_{i'}$. Any feasible solution that satisfies the constraint for $i$ automatically satisfies the constraint for $i'$, so $i'$ is redundant and can be removed.
 
-**Implementation.** In `row_reduce()`, active rows are sorted by coverage size (ascending), and for each pair $(i, i')$ where $|S_i| \leq |S_{i'}|$, a sorted-set subset check determines if $S_i \subseteq S_{i'}$. If so, $i'$ is deactivated.
+**Implementation.** In `row_reduce()`, active rows are sorted by coverage size (ascending), and for each pair $(i, i')$ where $|S_i| \leq |S_{i'}|$, a bitset subset check determines if $S_i \subseteq S_{i'}$. If so, $i'$ is deactivated. The bitset representation uses $\lceil n/64 \rceil$ words per row (where $n$ is the number of columns), enabling fast subset checks even for large instances.
 
 ### 3.3 Probing (Constraint Propagation)
 
@@ -63,19 +63,25 @@ After all probing, a final essential column cascade picks up any newly created e
 
 **Theory.** Column $j$ is *dominated* by column $k$ if $c_k \leq c_j$ and $R_j \subseteq R_k$ — that is, $k$ covers all the rows that $j$ covers, at no greater cost. In any optimal solution that uses $j$, replacing $j$ with $k$ yields a solution that is at least as good. Therefore $j$ can be removed.
 
-**Implementation.** The `SingleColumnDominanceRule` checks every pair of active columns. For each target column $j$, if any candidate $k$ has $c_k \leq c_j$ and $R_j \subseteq R_k$ (verified via sorted-set inclusion), then $j$ is deactivated. Tie-breaking: if costs are equal, the lower-indexed column is kept.
+**Implementation.** The `SingleColumnDominanceRule` checks every pair of active columns. For each target column $j$, if any candidate $k$ has $c_k \leq c_j$ and $R_j \subseteq R_k$, then $j$ is deactivated. Tie-breaking: if costs are equal, the lower-indexed column is kept.
+
+**Bitset acceleration.** Subset checks are accelerated using `DynBitset` (`src/bitset_util.h`): each column's row-coverage is encoded as a fixed-width bitset of $\lceil m/64 \rceil$ words. The subset check $R_j \subseteq R_k$ becomes $\lceil m/64 \rceil$ bitwise AND+CMP operations, replacing the $O(|R_j|)$ sorted-merge scan. For $m = 300$ (scpb instances), this is just 5 word comparisons.
 
 ### 3.5 Two-Column Dominance
 
 **Theory.** Column $j$ is *pair-dominated* if there exist columns $k_1, k_2$ such that $c_{k_1} + c_{k_2} < c_j$ and $R_j \subseteq R_{k_1} \cup R_{k_2}$. Any solution using $j$ can be improved by using $k_1$ and $k_2$ instead, so $j$ is redundant.
 
-**Implementation.** The `TwoColumnDominanceRule` iterates over all target columns and all pairs of candidates. The `unionCoversSorted()` helper efficiently checks whether the union of two sorted row sets covers the target's rows. Time limit checks prevent excessive computation on large instances.
+**Implementation.** The `TwoColumnDominanceRule` iterates over all target columns and all pairs of candidates. Time limit checks prevent excessive computation on large instances.
+
+**Bitset acceleration.** The union-covers check $R_j \subseteq R_{k_1} \cup R_{k_2}$ is performed using `DynBitset::is_subset_of_union()`, which computes $(R_j \mathbin{\&} (R_{k_1} \mathbin{|} R_{k_2})) = R_j$ with $\lceil m/64 \rceil$ OR+AND+CMP operations per pair.
 
 ### 3.6 Cost-Driven Replacement
 
 **Theory.** This generalizes pair dominance by considering 2-column and 3-column replacements, focused on expensive columns first. By processing columns in descending cost order, the most impactful reductions are found first. A column $j$ is removed if any combination of 2 or 3 cheaper columns covers all its rows at lower total cost.
 
 **Implementation.** The `CostDrivenReplacementRule` builds a reverse index (columns by row) to efficiently find candidate replacements. For each target column (processed from most expensive to cheapest), it collects all columns sharing at least one row with the target, sorts them by cost, and checks pairs and triples.
+
+**Bitset acceleration.** Pair and triple union-covers checks use `DynBitset::is_subset_of_union()` and `DynBitset::is_subset_of_union3()`, which compute the union-subset test in $\lceil m/64 \rceil$ bitwise operations regardless of column cardinalities.
 
 ### 3.7 Incumbent Budget Pruning
 
@@ -109,15 +115,25 @@ That is, it picks the column that covers the most uncovered rows per unit cost. 
 
 ### 4.2 Implementation
 
-The `greedy_set_cover_heuristic()` function in `src/preprocessor.cpp` implements the Chvátal greedy:
+The `greedy_set_cover_heuristic()` function in `src/preprocessor.cpp` implements the Chvátal greedy with **incremental coverage tracking**:
 
 1. Build a reverse index (rows covered by each column)
-2. Maintain a set of uncovered rows
-3. At each step, scan all unused columns, compute the number of uncovered rows each covers, and select the one with the highest coverage/cost ratio
-4. Mark covered rows, add the column to the solution
+2. Initialize per-column coverage counts `cov_count[j]` = number of uncovered rows column $j$ covers
+3. At each step, scan all unused columns, select the one with the highest `cov_count[j] / c_j` ratio
+4. Mark covered rows, and for each newly covered row, decrement `cov_count[k]` for all columns $k$ covering that row
 5. Repeat until all rows are covered
 
-The greedy solution provides the initial incumbent bound $z^*$ that enables cost reduction and budget pruning in subsequent preprocessing stages.
+The incremental update (step 4) ensures that coverage counts are maintained in $O(\text{nnz})$ total across all iterations, rather than recomputing from scratch at each step. The greedy solution provides the initial incumbent bound $z^*$ that enables cost reduction and budget pruning in subsequent preprocessing stages.
+
+## 4b. BnB Heuristic: Dual-Guided Cover Repair
+
+### Theory
+
+The `DualGuidedCoverRepairHeuristic` (`src/heuristics.cpp`) constructs integer-feasible solutions during branch-and-bound by combining LP relaxation information with greedy repair. Starting from the LP solution, it fixes near-integer variables and then greedily covers remaining rows using a score that combines uncovered-row gain and dual value gain, weighted by column cost.
+
+### Implementation
+
+The heuristic uses a **column-to-rows transpose** (built once per invocation) and **incremental coverage tracking** for both the repair phase and the post-processing redundancy removal. When a column is added to the solution, only its covered rows' coverage values are updated; when a column is tentatively removed in post-processing, only its entries are subtracted. This reduces per-invocation cost from $O(n \times m \times w)$ (where $w$ is average row width) to $O(\text{nnz})$.
 
 ## 5. Preprocessing Pipeline
 
@@ -170,7 +186,36 @@ Repeat until fixpoint:
 
 When a new incumbent is found during branch-and-bound, the tighter bound enables additional preprocessing. The functions `mid_bnb_column_removal()` and `mid_bnb_budget_pruning()` remove columns from the base model, remap all branch node decisions and cuts to the new variable indices, and prune frontier nodes whose dual bounds exceed the new incumbent.
 
-## 6. Configuration
+## 6. Bitset Infrastructure
+
+The `DynBitset` utility (`src/bitset_util.h`) provides a lightweight, variable-width bitset supporting subset and union-subset operations:
+
+| Operation | Complexity | Use |
+|-----------|-----------|-----|
+| `is_subset_of(other)` | $O(\lceil n/64 \rceil)$ | Column dominance |
+| `is_subset_of_union(a, b)` | $O(\lceil n/64 \rceil)$ | Two-column dominance |
+| `is_subset_of_union3(a, b, c)` | $O(\lceil n/64 \rceil)$ | Cost-driven replacement (triples) |
+| `popcount()` | $O(\lceil n/64 \rceil)$ | Coverage counting |
+
+For standard benchmark instances with $m = 200$-$300$ rows, this means 4-5 uint64 word operations per check, replacing $O(|R_j|)$ sorted-merge operations. The `build_column_bitsets()` helper builds bitsets for all active columns from the `rows_by_column` transpose.
+
+## 7. Node-Level Preprocessing
+
+During branch-and-bound, scpsol applies lightweight preprocessing at each node:
+
+### 7.1 Node-Level Propagation
+
+Before solving a node's LP relaxation, the `propagate_fixings()` function (from `src/reliability.cpp`) runs an essential-column cascade on the node's fixed variables. This can:
+- Detect infeasible nodes without an LP solve (when a row has no free columns)
+- Discover implied fixings that tighten the LP
+
+Propagation is only applied at nodes with $\geq 3$ decisions to avoid overhead on shallow nodes.
+
+### 7.2 Node-Level Reduced Cost Fixing
+
+After solving a node's LP, the solver computes reduced costs and fixes variables whose reduced cost exceeds the current gap ($z^* - z_{LP}^{\text{node}}$). These fixings are inherited by child nodes, progressively tightening the LP in deeper subtrees.
+
+## 8. Configuration
 
 The preprocessing behavior is controlled by the `SolverConfig` fields:
 
@@ -181,7 +226,7 @@ The preprocessing behavior is controlled by the `SolverConfig` fields:
 
 Available rule tokens: `single` (single column dominance), `two` (two-column dominance), `cost_driven` (cost-driven replacement), `incumbent_budget` (budget pruning), `none` (disable all).
 
-## 7. References
+## 9. References
 
 - V. Chvátal. A greedy heuristic for the set-covering problem. *Mathematics of Operations Research*, 4(3):233–235, 1979.
 - E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. *Mathematical Programming Study*, 12:37–60, 1980.
