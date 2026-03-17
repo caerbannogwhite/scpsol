@@ -15,6 +15,8 @@ public:
     LpSolution solve();
     void save_basis();
     void restore_basis();
+    HighsBasis get_basis() const;
+    void set_basis(const HighsBasis &basis);
     void rebuild_model(const BaseRelaxationModel &base);
     void rebuild_model_keep_basis(const BaseRelaxationModel &base);
 

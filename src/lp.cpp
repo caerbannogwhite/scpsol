@@ -164,6 +164,14 @@ void LpSolver::restore_basis() {
     }
 }
 
+HighsBasis LpSolver::get_basis() const {
+    return highs_.getBasis();
+}
+
+void LpSolver::set_basis(const HighsBasis &basis) {
+    highs_.setBasis(basis);
+}
+
 void LpSolver::rebuild_model(const BaseRelaxationModel &base) {
     build_model(base);
 }

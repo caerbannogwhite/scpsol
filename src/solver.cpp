@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <unordered_map>
 #include <memory>
 #include <queue>
 #include <string>
@@ -75,7 +76,8 @@ struct BestBoundFrontier {
         return idx;
     }
 
-    void prune(double best_obj, double tol, int verbosity) {
+    void prune(double best_obj, double tol, int verbosity,
+               std::unordered_map<int, HighsBasis> *bases = nullptr) {
         const double prune_bound = best_obj - tol;
         size_t before = heap.size();
         std::vector<int> surviving;
@@ -87,6 +89,8 @@ struct BestBoundFrontier {
                 surviving.push_back(idx);
                 if (nd.parent_dual_bound_raw < min_raw_bound)
                     min_raw_bound = nd.parent_dual_bound_raw;
+            } else if (bases) {
+                bases->erase(idx);
             }
         }
         heap = std::move(surviving);
@@ -893,6 +897,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     bool adj_valid = true;
 
     std::vector<BranchNodeState> nodes;
+    std::unordered_map<int, HighsBasis> node_bases;
     {
         BranchNodeState root_state;
         root_state.parent_dual_bound = std::isfinite(global_dual_bound)
@@ -992,8 +997,15 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             nd.cuts.clear(); nd.cuts.shrink_to_fit();
         }
 
+        // Retrieve per-node basis if available
+        auto basis_it = node_bases.find(node_id);
+        const bool has_node_basis = (basis_it != node_bases.end());
+
         // Bound check
-        if (branch_node.parent_dual_bound >= best_obj - tol) continue;
+        if (branch_node.parent_dual_bound >= best_obj - tol) {
+            if (has_node_basis) node_bases.erase(basis_it);
+            continue;
+        }
 
         // Node-level propagation: detect infeasibility and find implied fixings.
         // Only worthwhile when enough variables are fixed to create essential columns.
@@ -1016,13 +1028,19 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
         }
 
-        // Solve LP
+        // Solve LP with per-node basis warm-start
         lp.apply_decisions(augmented_decisions.empty() ? branch_node.decisions : augmented_decisions);
         lp.add_cuts(branch_node.cuts);
-        lp.restore_basis();
+        if (has_node_basis) {
+            lp.set_basis(basis_it->second);
+            node_bases.erase(basis_it);
+        } else {
+            lp.restore_basis();
+        }
         LpSolution sol = lp.solve();
         ++total_lp_solves;
         lp.save_basis();
+        HighsBasis node_basis = lp.get_basis();
         lp.restore_base_state();
 
         if (!sol.solved || sol.infeasible) {
@@ -1061,7 +1079,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
             if (incumbent_improved) {
                 node_at_last_gap_improvement = processed_nodes;
-                frontier.prune(best_obj, tol, verbosity);
+                frontier.prune(best_obj, tol, verbosity, &node_bases);
                 if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0) {
                     lp.rebuild_model_keep_basis(base); adj_valid = false;
                 }
@@ -1085,7 +1103,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
                     fprintf(stderr, "* [%8.3fs] New incumbent: %.8f (exact)\n", t, best_obj);
                 }
-                frontier.prune(best_obj, tol, verbosity);
+                frontier.prune(best_obj, tol, verbosity, &node_bases);
                 if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0) {
                     lp.rebuild_model_keep_basis(base); adj_valid = false;
                 }
@@ -1124,8 +1142,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 int enqueued = 0;
                 for (auto &child : children) {
                     if (!is_node_provably_infeasible(child, base)) {
+                        const int child_id = static_cast<int>(nodes.size());
                         nodes.push_back(std::move(child));
-                        frontier.push(static_cast<int>(nodes.size()) - 1);
+                        node_bases[child_id] = node_basis;
+                        frontier.push(child_id);
                         ++enqueued;
                     }
                 }
@@ -1164,8 +1184,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 if (!is_node_provably_infeasible(child_zero, base)) {
                     child_zero.parent_dual_bound = node_dual_bound;
                     child_zero.parent_dual_bound_raw = node_dual_bound_raw;
+                    const int child_id = static_cast<int>(nodes.size());
                     nodes.push_back(std::move(child_zero));
-                    frontier.push(static_cast<int>(nodes.size()) - 1);
+                    node_bases[child_id] = node_basis;
+                    frontier.push(child_id);
                 }
             }
 
@@ -1176,8 +1198,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 if (!is_node_provably_infeasible(child_one, base)) {
                     child_one.parent_dual_bound = node_dual_bound;
                     child_one.parent_dual_bound_raw = node_dual_bound_raw;
+                    const int child_id = static_cast<int>(nodes.size());
                     nodes.push_back(std::move(child_one));
-                    frontier.push(static_cast<int>(nodes.size()) - 1);
+                    node_bases[child_id] = node_basis;
+                    frontier.push(child_id);
                 }
             }
         }
