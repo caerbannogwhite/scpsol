@@ -738,4 +738,161 @@ make_preprocess_rules(const std::string &configured) {
     return rules;
 }
 
+// ================================================================
+// Dominance Finder (Algorithm 1 from report-dominance-preproc.pdf)
+// ================================================================
+//
+// For each non-unit-cost column (processed cheapest first), solve a sub-MIP:
+// "Can the current set of cheaper/unit-cost columns cover all the rows
+// that this column covers, at total cost <= this column's cost?"
+// If yes, the column is redundant and can be removed.
+// If no (infeasible or too expensive), the column must be kept.
+
+int dominance_finder(ColumnPreprocessContext &ctx, double tol,
+                     double /*time_limit_per_sub_mip*/, int verbosity) {
+    const int ncols = ctx.ncols;
+    const int nrows = ctx.nrows;
+    if (ncols <= 0 || nrows <= 0) return 0;
+
+    // Partition columns: N_tilde = unit cost, N_hat = rest (sorted by cost ascending)
+    std::vector<int> n_tilde; // "kept" columns (initially unit cost)
+    std::vector<int> n_hat;   // candidates to test (non-unit cost)
+
+    for (int j = 0; j < ncols; ++j) {
+        if (!ctx.active[static_cast<size_t>(j)]) continue;
+        if (std::fabs(ctx.costs[static_cast<size_t>(j)] - 1.0) <= tol)
+            n_tilde.push_back(j);
+        else
+            n_hat.push_back(j);
+    }
+
+    // Sort N_hat by ascending cost (cheapest first, as per Algorithm 1)
+    std::sort(n_hat.begin(), n_hat.end(), [&](int a, int b) {
+        return ctx.costs[static_cast<size_t>(a)] < ctx.costs[static_cast<size_t>(b)];
+    });
+
+    if (n_hat.empty()) return 0;
+
+    // Build reverse index: for each row, which n_tilde columns cover it
+    // This is rebuilt incrementally as n_tilde grows
+    std::vector<std::vector<int>> tilde_cols_by_row(static_cast<size_t>(nrows));
+    for (int col : n_tilde) {
+        for (int r : ctx.rows_by_column[static_cast<size_t>(col)]) {
+            if (r >= 0 && r < nrows)
+                tilde_cols_by_row[static_cast<size_t>(r)].push_back(col);
+        }
+    }
+
+    int removed = 0;
+
+    // Reusable buffers to avoid per-column allocation
+    std::vector<char> uncovered(static_cast<size_t>(nrows), 0);
+    std::vector<int> candidate_cols;
+    std::vector<char> is_candidate(static_cast<size_t>(ncols), 0);
+
+    for (int hat_col : n_hat) {
+        if (std::chrono::steady_clock::now() >= ctx.deadline) break;
+        if (!ctx.active[static_cast<size_t>(hat_col)]) continue;
+
+        const double hat_cost = ctx.costs[static_cast<size_t>(hat_col)];
+        const auto &hat_rows = ctx.rows_by_column[static_cast<size_t>(hat_col)];
+        if (hat_rows.empty()) continue;
+
+        const int n_hat_rows = static_cast<int>(hat_rows.size());
+
+        // Quick feasibility check: every hat_row must have >= 1 n_tilde column
+        bool feasible = true;
+        for (int r : hat_rows) {
+            if (tilde_cols_by_row[static_cast<size_t>(r)].empty()) {
+                feasible = false;
+                break;
+            }
+        }
+        if (!feasible) {
+            n_tilde.push_back(hat_col);
+            for (int r : ctx.rows_by_column[static_cast<size_t>(hat_col)]) {
+                if (r >= 0 && r < nrows)
+                    tilde_cols_by_row[static_cast<size_t>(r)].push_back(hat_col);
+            }
+            continue;
+        }
+
+        // Greedy set cover: try to cover hat_rows using n_tilde columns
+        // within budget hat_cost
+        // Mark hat_rows as uncovered
+        for (int r : hat_rows) uncovered[static_cast<size_t>(r)] = 1;
+
+        // Collect candidate n_tilde columns (those covering >= 1 hat_row)
+        candidate_cols.clear();
+        for (int r : hat_rows) {
+            for (int c : tilde_cols_by_row[static_cast<size_t>(r)]) {
+                if (!is_candidate[static_cast<size_t>(c)]) {
+                    is_candidate[static_cast<size_t>(c)] = 1;
+                    candidate_cols.push_back(c);
+                }
+            }
+        }
+
+        double remaining_budget = hat_cost;
+        int rows_left = n_hat_rows;
+        bool covered_all = false;
+
+        while (rows_left > 0 && remaining_budget > tol) {
+            // Pick candidate with best coverage of uncovered hat_rows per cost
+            int best_col = -1;
+            double best_score = -1.0;
+            int best_gain = 0;
+            for (int c : candidate_cols) {
+                const double c_cost = ctx.costs[static_cast<size_t>(c)];
+                if (c_cost > remaining_budget + tol) continue;
+                int gain = 0;
+                for (int r : ctx.rows_by_column[static_cast<size_t>(c)]) {
+                    if (r >= 0 && r < nrows && uncovered[static_cast<size_t>(r)])
+                        ++gain;
+                }
+                if (gain <= 0) continue;
+                const double score = static_cast<double>(gain) / std::max(1e-9, c_cost);
+                if (score > best_score) {
+                    best_score = score;
+                    best_col = c;
+                    best_gain = gain;
+                }
+            }
+            if (best_col < 0) break;
+
+            // Select best_col
+            remaining_budget -= ctx.costs[static_cast<size_t>(best_col)];
+            for (int r : ctx.rows_by_column[static_cast<size_t>(best_col)]) {
+                if (r >= 0 && r < nrows && uncovered[static_cast<size_t>(r)]) {
+                    uncovered[static_cast<size_t>(r)] = 0;
+                    --rows_left;
+                }
+            }
+            if (rows_left <= 0) { covered_all = true; break; }
+        }
+
+        // Clean up uncovered flags and candidate flags
+        for (int r : hat_rows) uncovered[static_cast<size_t>(r)] = 0;
+        for (int c : candidate_cols) is_candidate[static_cast<size_t>(c)] = 0;
+
+        if (covered_all && remaining_budget >= -tol) {
+            ctx.active[static_cast<size_t>(hat_col)] = 0;
+            ++removed;
+        } else {
+            // Keep the column: add to n_tilde for future tests
+            n_tilde.push_back(hat_col);
+            for (int r : ctx.rows_by_column[static_cast<size_t>(hat_col)]) {
+                if (r >= 0 && r < nrows)
+                    tilde_cols_by_row[static_cast<size_t>(r)].push_back(hat_col);
+            }
+        }
+    }
+
+    if (verbosity >= 2 && removed > 0) {
+        fprintf(stderr, "  Dominance Finder: %d cols removed\n", removed);
+    }
+
+    return removed;
+}
+
 } // namespace scpsol

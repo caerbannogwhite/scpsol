@@ -42,6 +42,12 @@ public:
 std::vector<std::unique_ptr<IColumnPreprocessRule>>
 make_preprocess_rules(const std::string &configured);
 
+// Dominance Finder: for each non-unit-cost column, use greedy set cover to
+// check if cheaper columns can collectively cover the same rows at lower cost.
+// Returns number of columns removed. Modifies ctx.active in place.
+int dominance_finder(ColumnPreprocessContext &ctx, double tol,
+                     double time_limit_per_sub_mip, int verbosity);
+
 } // namespace scpsol
 
 #endif // SCPSOL_PREPROCESSOR_H

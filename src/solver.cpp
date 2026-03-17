@@ -493,6 +493,72 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         }
         if (ncols < cols_before && verbosity >= 2)
             fprintf(stderr, "  Pre-LP reduction: cols %d -> %d, rows %d\n", cols_before, ncols, nrows);
+
+        // Dominance Finder: greedy multi-column dominance removal
+        if (ncols > 0 && nrows > 0) {
+            ColumnPreprocessContext df_ctx;
+            df_ctx.nrows = nrows;
+            df_ctx.ncols = ncols;
+            df_ctx.costs.resize(static_cast<size_t>(ncols));
+            df_ctx.active.assign(static_cast<size_t>(ncols), 1);
+            df_ctx.rows_by_column.resize(static_cast<size_t>(ncols));
+            df_ctx.deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(static_cast<int>(config.preprocess_time_limit));
+
+            for (int j = 0; j < ncols; ++j)
+                df_ctx.costs[static_cast<size_t>(j)] = obj[static_cast<size_t>(j)];
+            // Build column-to-rows transpose from CSR in O(nnz)
+            for (int i = 0; i < nrows; ++i) {
+                for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                    const int col = csr_inds[static_cast<size_t>(k)];
+                    if (col >= 0 && col < ncols)
+                        df_ctx.rows_by_column[static_cast<size_t>(col)].push_back(i);
+                }
+            }
+
+            int df_removed = dominance_finder(df_ctx, tol, 0.5, verbosity);
+            if (df_removed > 0) {
+                // Apply removals
+                std::vector<int> old_to_new(static_cast<size_t>(ncols), -1);
+                int new_idx = 0;
+                for (int j = 0; j < ncols; ++j) {
+                    if (df_ctx.active[static_cast<size_t>(j)])
+                        old_to_new[static_cast<size_t>(j)] = new_idx++;
+                }
+                // Compact arrays
+                std::vector<double> new_obj;
+                std::vector<int> new_active;
+                for (int j = 0; j < ncols; ++j) {
+                    if (df_ctx.active[static_cast<size_t>(j)]) {
+                        new_obj.push_back(obj[static_cast<size_t>(j)]);
+                        new_active.push_back(active_to_input[static_cast<size_t>(j)]);
+                    }
+                }
+                // Remap CSR
+                std::vector<int> new_inds;
+                std::vector<int> new_offs = {0};
+                std::vector<double> new_vals;
+                for (int i = 0; i < nrows; ++i) {
+                    for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                        const int old_col = csr_inds[static_cast<size_t>(k)];
+                        if (old_col >= 0 && old_col < ncols && old_to_new[static_cast<size_t>(old_col)] >= 0) {
+                            new_inds.push_back(old_to_new[static_cast<size_t>(old_col)]);
+                            new_vals.push_back(csr_vals[static_cast<size_t>(k)]);
+                        }
+                    }
+                    new_offs.push_back(static_cast<int>(new_inds.size()));
+                }
+                ncols = new_idx;
+                obj = std::move(new_obj);
+                active_to_input = std::move(new_active);
+                csr_inds = std::move(new_inds);
+                csr_offs = std::move(new_offs);
+                csr_vals = std::move(new_vals);
+
+                if (verbosity >= 2)
+                    fprintf(stderr, "  Dominance Finder: %d cols removed, %d remaining\n", df_removed, ncols);
+            }
+        }
     }
 
     // Check if all rows are covered by essential columns
