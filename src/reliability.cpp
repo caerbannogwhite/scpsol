@@ -180,7 +180,8 @@ int reliability_branch_select(
     int max_sb_candidates,
     double /*integ_tol*/,
     int verbosity,
-    int &lp_solves_out) {
+    int &lp_solves_out,
+    const ScpAdjacency *cached_adj) {
 
     if (fractional_candidates.empty()) return -1;
 
@@ -188,8 +189,13 @@ int reliability_branch_select(
     const double eps = 1e-6;
     lp_solves_out = 0;
 
-    // Build adjacency once for propagation
-    ScpAdjacency adj = build_adjacency(base);
+    // Use cached adjacency if provided, otherwise build
+    ScpAdjacency local_adj;
+    if (!cached_adj) {
+        local_adj = build_adjacency(base);
+        cached_adj = &local_adj;
+    }
+    const ScpAdjacency &adj = *cached_adj;
 
     // Partition candidates: unreliable first (need strong branching), then reliable.
     // Among unreliable, prioritize those closest to 0.5 (most fractional).

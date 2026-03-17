@@ -58,7 +58,8 @@ int reliability_branch_select(
     int max_sb_candidates,
     double integ_tol,
     int verbosity,
-    int &lp_solves_out);
+    int &lp_solves_out,
+    const ScpAdjacency *cached_adj = nullptr);
 
 } // namespace scpsol
 

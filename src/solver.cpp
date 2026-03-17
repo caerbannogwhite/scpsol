@@ -11,9 +11,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <deque>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <queue>
 #include <string>
 
 namespace scpsol {
@@ -36,30 +37,64 @@ static void adopt_incumbent_solution(
     }
 }
 
-static void prune_frontier(
-    std::deque<int> &frontier,
-    const std::vector<BranchNodeState> &nodes,
-    double best_obj,
-    double tol,
-    int verbosity) {
-    const double prune_bound = best_obj - tol;
-    size_t before = frontier.size();
-    std::deque<int> surviving;
-    for (const int idx : frontier) {
-        if (nodes[static_cast<size_t>(idx)].parent_dual_bound < prune_bound)
-            surviving.push_back(idx);
+// Best-bound frontier: nodes ordered by ascending parent_dual_bound.
+// Uses a vector managed as a min-heap for efficient best-bound selection.
+struct BestBoundFrontier {
+    std::vector<int> heap;
+    const std::vector<BranchNodeState> *nodes_ptr = nullptr;
+
+    void init(const std::vector<BranchNodeState> *np) { nodes_ptr = np; }
+
+    bool empty() const { return heap.empty(); }
+    size_t size() const { return heap.size(); }
+
+    bool cmp(int a, int b) const {
+        return (*nodes_ptr)[static_cast<size_t>(a)].parent_dual_bound >
+               (*nodes_ptr)[static_cast<size_t>(b)].parent_dual_bound;
     }
-    frontier.swap(surviving);
-    if (frontier.size() < before && verbosity >= 3) {
-        fprintf(stderr, "           Frontier pruned: %zu -> %zu nodes\n", before, frontier.size());
+
+    void push(int idx) {
+        heap.push_back(idx);
+        std::push_heap(heap.begin(), heap.end(),
+            [this](int a, int b) { return cmp(a, b); });
     }
-}
+
+    int pop() {
+        std::pop_heap(heap.begin(), heap.end(),
+            [this](int a, int b) { return cmp(a, b); });
+        int idx = heap.back();
+        heap.pop_back();
+        return idx;
+    }
+
+    void prune(double best_obj, double tol, int verbosity) {
+        const double prune_bound = best_obj - tol;
+        size_t before = heap.size();
+        std::vector<int> surviving;
+        surviving.reserve(heap.size());
+        for (const int idx : heap) {
+            if ((*nodes_ptr)[static_cast<size_t>(idx)].parent_dual_bound < prune_bound)
+                surviving.push_back(idx);
+        }
+        heap = std::move(surviving);
+        std::make_heap(heap.begin(), heap.end(),
+            [this](int a, int b) { return cmp(a, b); });
+        if (heap.size() < before && verbosity >= 3) {
+            fprintf(stderr, "           Frontier pruned: %zu -> %zu nodes\n", before, heap.size());
+        }
+    }
+
+    void rebuild_heap() {
+        std::make_heap(heap.begin(), heap.end(),
+            [this](int a, int b) { return cmp(a, b); });
+    }
+};
 
 static int mid_bnb_column_removal(
     BaseRelaxationModel &base,
     double best_obj,
     double tol,
-    std::deque<int> &frontier,
+    BestBoundFrontier &frontier,
     std::vector<BranchNodeState> &nodes,
     int verbosity,
     PseudocostState *pc_state = nullptr) {
@@ -68,12 +103,13 @@ static int mid_bnb_column_removal(
     if (verbosity >= 3)
         fprintf(stderr, "           Mid-BnB reduction: %d cols removed, %d remaining\n",
                 reduction.columns_removed, base.ncols);
-    std::deque<int> surviving;
-    for (const int idx : frontier) {
+    std::vector<int> surviving;
+    for (const int idx : frontier.heap) {
         if (remap_branch_node(nodes[static_cast<size_t>(idx)], reduction.old_to_new))
             surviving.push_back(idx);
     }
-    frontier.swap(surviving);
+    frontier.heap = std::move(surviving);
+    frontier.rebuild_heap();
     if (pc_state) pc_state->remap(reduction.old_to_new, base.ncols);
     return reduction.columns_removed;
 }
@@ -83,7 +119,7 @@ static int mid_bnb_budget_pruning(
     double best_obj,
     double tol,
     double preprocess_time_limit,
-    std::deque<int> &frontier,
+    BestBoundFrontier &frontier,
     std::vector<BranchNodeState> &nodes,
     int verbosity,
     PseudocostState *pc_state = nullptr) {
@@ -93,12 +129,13 @@ static int mid_bnb_budget_pruning(
     if (verbosity >= 3)
         fprintf(stderr, "           Mid-BnB budget pruning: %d cols removed, %d remaining\n",
                 reduction.columns_removed, base.ncols);
-    std::deque<int> surviving;
-    for (const int idx : frontier) {
+    std::vector<int> surviving;
+    for (const int idx : frontier.heap) {
         if (remap_branch_node(nodes[static_cast<size_t>(idx)], reduction.old_to_new))
             surviving.push_back(idx);
     }
-    frontier.swap(surviving);
+    frontier.heap = std::move(surviving);
+    frontier.rebuild_heap();
     if (pc_state) pc_state->remap(reduction.old_to_new, base.ncols);
     return reduction.columns_removed;
 }
@@ -828,6 +865,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     PseudocostState pc_state;
     pc_state.init(base.ncols);
 
+    // Cache adjacency for reliability branching propagation
+    ScpAdjacency cached_adj = build_adjacency(base);
+    bool adj_valid = true;
+
     std::vector<BranchNodeState> nodes;
     {
         BranchNodeState root_state;
@@ -840,8 +881,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         nodes.push_back(root_state);
     }
 
-    std::deque<int> frontier;
-    frontier.push_back(0);
+    BestBoundFrontier frontier;
+    frontier.init(&nodes);
+    frontier.push(0);
 
     int processed_nodes = 0;
     bool gap_tolerance_reached = false;
@@ -917,8 +959,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             frontier_exhausted = true;
             break;
         }
-        const int node_id = frontier.front();
-        frontier.pop_front();
+        const int node_id = frontier.pop();
         const BranchNodeState branch_node = nodes[static_cast<size_t>(node_id)];
 
         // Bound check
@@ -969,11 +1010,13 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
             if (incumbent_improved) {
                 node_at_last_gap_improvement = processed_nodes;
-                prune_frontier(frontier, nodes, best_obj, tol, verbosity);
-                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0)
-                    lp.rebuild_model_keep_basis(base);
-                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0)
-                    lp.rebuild_model_keep_basis(base);
+                frontier.prune(best_obj, tol, verbosity);
+                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0) {
+                    lp.rebuild_model_keep_basis(base); adj_valid = false;
+                }
+                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0) {
+                    lp.rebuild_model_keep_basis(base); adj_valid = false;
+                }
             }
         }
 
@@ -991,11 +1034,13 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
                     fprintf(stderr, "* [%8.3fs] New incumbent: %.8f (exact)\n", t, best_obj);
                 }
-                prune_frontier(frontier, nodes, best_obj, tol, verbosity);
-                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0)
-                    lp.rebuild_model_keep_basis(base);
-                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0)
-                    lp.rebuild_model_keep_basis(base);
+                frontier.prune(best_obj, tol, verbosity);
+                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0) {
+                    lp.rebuild_model_keep_basis(base); adj_valid = false;
+                }
+                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0) {
+                    lp.rebuild_model_keep_basis(base); adj_valid = false;
+                }
             }
             continue;
         }
@@ -1016,7 +1061,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 for (auto &child : children) {
                     if (!is_node_provably_infeasible(child, base)) {
                         nodes.push_back(std::move(child));
-                        frontier.push_back(static_cast<int>(nodes.size()) - 1);
+                        frontier.push(static_cast<int>(nodes.size()) - 1);
                         ++enqueued;
                     }
                 }
@@ -1034,10 +1079,14 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             int branch_var;
             if (use_reliability) {
                 int sb_lps = 0;
+                if (!adj_valid) {
+                    cached_adj = build_adjacency(base);
+                    adj_valid = true;
+                }
                 branch_var = reliability_branch_select(
                     pc_state, lp, base, branch_node, sol, fractional,
                     best_obj, config.reliability_eta, config.reliability_max_sb,
-                    integ_tol, verbosity, sb_lps);
+                    integ_tol, verbosity, sb_lps, &cached_adj);
                 total_lp_solves += sb_lps;
             } else {
                 branch_var = selector->select(sol.col_value, base.obj, fractional);
@@ -1050,7 +1099,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 child_zero.parent_dual_bound = node_dual_bound;
                 child_zero.parent_dual_bound_raw = node_dual_bound_raw;
                 nodes.push_back(child_zero);
-                frontier.push_back(static_cast<int>(nodes.size()) - 1);
+                frontier.push(static_cast<int>(nodes.size()) - 1);
             }
 
             BranchNodeState child_one;
@@ -1059,15 +1108,16 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 child_one.parent_dual_bound = node_dual_bound;
                 child_one.parent_dual_bound_raw = node_dual_bound_raw;
                 nodes.push_back(child_one);
-                frontier.push_back(static_cast<int>(nodes.size()) - 1);
+                frontier.push(static_cast<int>(nodes.size()) - 1);
             }
         }
 
         // Update global dual bound from frontier
+        // With best-bound ordering, the top of the heap has the minimum bound
         {
             double new_bound = std::numeric_limits<double>::infinity();
             double new_bound_raw = std::numeric_limits<double>::infinity();
-            for (const int idx : frontier) {
+            for (const int idx : frontier.heap) {
                 new_bound = std::min(new_bound, nodes[static_cast<size_t>(idx)].parent_dual_bound);
                 new_bound_raw = std::min(new_bound_raw, nodes[static_cast<size_t>(idx)].parent_dual_bound_raw);
             }
@@ -1142,6 +1192,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     if (total_cuts > 0) {
                         // Rebuild to sync base model with LP
                         lp.rebuild_model(base);
+                        adj_valid = false;
 
                         // Validate: check if cuts improved the tightened dual
                         double post_cut_dual = sol.optimal ? sol.dual_obj : pre_cut_dual;
@@ -1193,7 +1244,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     {
         double new_bound = std::numeric_limits<double>::infinity();
         double new_bound_raw = std::numeric_limits<double>::infinity();
-        for (const int idx : frontier) {
+        for (const int idx : frontier.heap) {
             new_bound = std::min(new_bound, nodes[static_cast<size_t>(idx)].parent_dual_bound);
             new_bound_raw = std::min(new_bound_raw, nodes[static_cast<size_t>(idx)].parent_dual_bound_raw);
         }

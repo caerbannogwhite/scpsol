@@ -41,6 +41,8 @@ static void csr_to_csc(int nrows, int ncols,
 void LpSolver::build_model(const BaseRelaxationModel &base) {
     highs_.clear();
     highs_.setOptionValue("output_flag", false);
+    highs_.setOptionValue("presolve", "off");
+    highs_.setOptionValue("simplex_strategy", 1); // dual simplex
 
     const int ncols = base.ncols;
     const int nrows = base.nrows;
