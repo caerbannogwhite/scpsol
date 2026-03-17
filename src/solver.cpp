@@ -125,6 +125,7 @@ static int mid_bnb_column_removal(
     PseudocostState *pc_state = nullptr) {
     ModelReductionResult reduction = reduce_base_model(base, best_obj, tol);
     if (reduction.columns_removed <= 0) return 0;
+    base.build_transpose();
     if (verbosity >= 3)
         fprintf(stderr, "           Mid-BnB reduction: %d cols removed, %d remaining\n",
                 reduction.columns_removed, base.ncols);
@@ -152,6 +153,7 @@ static int mid_bnb_budget_pruning(
     ModelReductionResult reduction = reduce_base_model_budget_pruning(
         base, best_obj, tol, preprocess_time_limit);
     if (reduction.columns_removed <= 0) return 0;
+    base.build_transpose();
     if (verbosity >= 3)
         fprintf(stderr, "           Mid-BnB budget pruning: %d cols removed, %d remaining\n",
                 reduction.columns_removed, base.ncols);
@@ -602,6 +604,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         base.rhs.assign(static_cast<size_t>(nrows), 1.0);
         base.active_to_original = active_to_input;
         base.base_cuts.clear();
+        base.build_transpose();
     };
     build_base();
 

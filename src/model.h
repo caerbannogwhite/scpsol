@@ -49,6 +49,21 @@ struct BaseRelaxationModel {
     std::vector<double> rhs;
     std::vector<int> active_to_original;
     std::vector<CutConstraint> base_cuts; // cuts appended to base model
+
+    // Cached column-to-rows transpose
+    struct ColRowEntry { int row; double val; };
+    std::vector<std::vector<ColRowEntry>> cols_to_rows;
+
+    void build_transpose() {
+        cols_to_rows.assign(static_cast<size_t>(ncols), {});
+        for (int i = 0; i < nrows; ++i) {
+            for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                const int col = csr_inds[static_cast<size_t>(k)];
+                if (col >= 0 && col < ncols)
+                    cols_to_rows[static_cast<size_t>(col)].push_back({i, csr_vals[static_cast<size_t>(k)]});
+            }
+        }
+    }
 };
 
 struct LpSolution {

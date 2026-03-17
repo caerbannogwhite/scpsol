@@ -111,16 +111,9 @@ public:
         std::vector<char> fixed_one(static_cast<size_t>(ncols), 0);
         std::vector<double> coverage(static_cast<size_t>(nrows), 0.0);
 
-        // Build column-to-rows transpose and per-row coefficient lookup
-        struct ColRowEntry { int row; double val; };
-        std::vector<std::vector<ColRowEntry>> rows_by_col(static_cast<size_t>(ncols));
-        for (int i = 0; i < nrows; ++i) {
-            for (int k = base.csr_offs[static_cast<size_t>(i)]; k < base.csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                const int col = base.csr_inds[static_cast<size_t>(k)];
-                if (col >= 0 && col < ncols)
-                    rows_by_col[static_cast<size_t>(col)].push_back({i, base.csr_vals[static_cast<size_t>(k)]});
-            }
-        }
+        // Use cached transpose from base model
+        const auto &rows_by_col = base.cols_to_rows;
+        if (static_cast<int>(rows_by_col.size()) < ncols) return out;
 
         for (const BranchDecision &d : branch_node.decisions) {
             if (d.var_index < 0 || d.var_index >= ncols) continue;
