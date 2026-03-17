@@ -87,6 +87,33 @@ GreedySetCoverResult greedy_set_cover_heuristic(
     }
 
     if (uncovered_count == 0) {
+        // Post-process: remove redundant columns (most expensive first)
+        std::sort(result.selected_columns.begin(), result.selected_columns.end(),
+                  [&](int a, int b) { return obj[a] > obj[b]; });
+        // Reset coverage tracking using all selected columns
+        std::vector<int> row_coverage(static_cast<size_t>(nrows), 0);
+        for (int col : result.selected_columns) {
+            for (int row : rows_by_col[static_cast<size_t>(col)])
+                ++row_coverage[static_cast<size_t>(row)];
+        }
+        std::vector<int> kept;
+        for (int col : result.selected_columns) {
+            bool can_remove = true;
+            for (int row : rows_by_col[static_cast<size_t>(col)]) {
+                if (row_coverage[static_cast<size_t>(row)] <= 1) {
+                    can_remove = false;
+                    break;
+                }
+            }
+            if (can_remove) {
+                total_cost -= obj[col];
+                for (int row : rows_by_col[static_cast<size_t>(col)])
+                    --row_coverage[static_cast<size_t>(row)];
+            } else {
+                kept.push_back(col);
+            }
+        }
+        result.selected_columns = std::move(kept);
         result.feasible = true;
         result.objective = total_cost;
     }
