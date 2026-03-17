@@ -1,4 +1,5 @@
 #include "preprocessor.h"
+#include "bitset_util.h"
 
 #include <algorithm>
 #include <cctype>
@@ -161,16 +162,15 @@ class SingleColumnDominanceRule : public IColumnPreprocessRule {
 public:
     const char *name() const override { return "single_column_dominance"; }
     int apply(ColumnPreprocessContext &ctx, double tol) const override {
+        auto bitsets = build_column_bitsets(ctx.ncols, ctx.nrows, ctx.rows_by_column, ctx.active);
         int removed = 0;
         for (int target = 0; target < ctx.ncols; ++target) {
             if (std::chrono::steady_clock::now() >= ctx.deadline) break;
             if (!ctx.active[static_cast<size_t>(target)]) continue;
-            const auto &target_rows = ctx.rows_by_column[static_cast<size_t>(target)];
             for (int cand = 0; cand < ctx.ncols; ++cand) {
                 if (cand == target || !ctx.active[static_cast<size_t>(cand)]) continue;
                 if (ctx.costs[static_cast<size_t>(cand)] > ctx.costs[static_cast<size_t>(target)] + tol) continue;
-                const auto &cand_rows = ctx.rows_by_column[static_cast<size_t>(cand)];
-                if (!isSubsetSorted(target_rows, cand_rows)) continue;
+                if (!bitsets[static_cast<size_t>(target)].is_subset_of(bitsets[static_cast<size_t>(cand)])) continue;
                 if (fabs(ctx.costs[static_cast<size_t>(cand)] - ctx.costs[static_cast<size_t>(target)]) <= tol && cand > target) continue;
                 ctx.active[static_cast<size_t>(target)] = 0;
                 ++removed;
@@ -185,12 +185,12 @@ class TwoColumnDominanceRule : public IColumnPreprocessRule {
 public:
     const char *name() const override { return "two_column_dominance"; }
     int apply(ColumnPreprocessContext &ctx, double tol) const override {
+        auto bitsets = build_column_bitsets(ctx.ncols, ctx.nrows, ctx.rows_by_column, ctx.active);
         int removed = 0;
         bool timed_out = false;
         for (int target = 0; target < ctx.ncols && !timed_out; ++target) {
             if (std::chrono::steady_clock::now() >= ctx.deadline) break;
             if (!ctx.active[static_cast<size_t>(target)]) continue;
-            const auto &target_rows = ctx.rows_by_column[static_cast<size_t>(target)];
             const double target_cost = ctx.costs[static_cast<size_t>(target)];
             bool dominated = false;
             for (int a = 0; a < ctx.ncols && !dominated; ++a) {
@@ -202,8 +202,8 @@ public:
                     if (b == target || !ctx.active[static_cast<size_t>(b)]) continue;
                     const double pair_cost = a_cost + ctx.costs[static_cast<size_t>(b)];
                     if (pair_cost >= target_cost - tol) continue;
-                    if (unionCoversSorted(target_rows, ctx.rows_by_column[static_cast<size_t>(a)],
-                                          ctx.rows_by_column[static_cast<size_t>(b)])) {
+                    if (bitsets[static_cast<size_t>(target)].is_subset_of_union(
+                            bitsets[static_cast<size_t>(a)], bitsets[static_cast<size_t>(b)])) {
                         dominated = true;
                         break;
                     }
@@ -223,6 +223,8 @@ public:
     const char *name() const override { return "cost_driven_replacement"; }
     int apply(ColumnPreprocessContext &ctx, double tol) const override {
         if (ctx.nrows <= 0 || ctx.ncols <= 0) return 0;
+
+        auto bitsets = build_column_bitsets(ctx.ncols, ctx.nrows, ctx.rows_by_column, ctx.active);
 
         std::vector<std::vector<int>> columns_by_row(static_cast<size_t>(ctx.nrows));
         for (int j = 0; j < ctx.ncols; ++j) {
@@ -265,6 +267,7 @@ public:
                       [&](int a, int b) { return ctx.costs[static_cast<size_t>(a)] < ctx.costs[static_cast<size_t>(b)]; });
 
             bool dominated = false;
+            const auto &target_bs = bitsets[static_cast<size_t>(target)];
 
             // Try pairs
             for (size_t i = 0; i < candidates.size() && !dominated; ++i) {
@@ -275,8 +278,8 @@ public:
                 for (size_t j = i + 1; j < candidates.size() && !dominated; ++j) {
                     const int b = candidates[j];
                     if (cost_a + ctx.costs[static_cast<size_t>(b)] > target_cost + tol) break;
-                    if (unionCoversSorted(target_rows, ctx.rows_by_column[static_cast<size_t>(a)],
-                                          ctx.rows_by_column[static_cast<size_t>(b)])) {
+                    if (target_bs.is_subset_of_union(
+                            bitsets[static_cast<size_t>(a)], bitsets[static_cast<size_t>(b)])) {
                         dominated = true;
                     }
                 }
@@ -297,9 +300,10 @@ public:
                         for (size_t k = j + 1; k < candidates.size() && !dominated; ++k) {
                             const int c = candidates[k];
                             if (cost_ab + ctx.costs[static_cast<size_t>(c)] > target_cost + tol) break;
-                            if (tripleUnionCoversSorted(target_rows, ctx.rows_by_column[static_cast<size_t>(a)],
-                                                        ctx.rows_by_column[static_cast<size_t>(b)],
-                                                        ctx.rows_by_column[static_cast<size_t>(c)])) {
+                            if (target_bs.is_subset_of_union3(
+                                    bitsets[static_cast<size_t>(a)],
+                                    bitsets[static_cast<size_t>(b)],
+                                    bitsets[static_cast<size_t>(c)])) {
                                 dominated = true;
                             }
                         }
@@ -491,40 +495,40 @@ RowReductionResult row_reduce(
         }
     }
 
-    // ---- Phase 2: Row domination ----
+    // ---- Phase 2: Row domination (bitset-accelerated) ----
     // If the active columns covering row A are a subset of those covering row B,
     // then any solution satisfying A automatically satisfies B. Remove B.
-    // Sort rows by coverage size (ascending) so smaller sets are checked first.
-    std::vector<std::vector<int>> active_cols_sorted(static_cast<size_t>(nrows));
-    std::vector<int> row_order;
-    for (int i = 0; i < nrows; ++i) {
-        if (!row_active[static_cast<size_t>(i)]) continue;
-        for (int c : cols_by_row[static_cast<size_t>(i)]) {
-            if (col_active[static_cast<size_t>(c)])
-                active_cols_sorted[static_cast<size_t>(i)].push_back(c);
+    {
+        std::vector<DynBitset> row_bitsets(static_cast<size_t>(nrows));
+        std::vector<int> row_order;
+        std::vector<int> row_sizes(static_cast<size_t>(nrows), 0);
+        for (int i = 0; i < nrows; ++i) {
+            row_bitsets[static_cast<size_t>(i)].init(ncols);
+            if (!row_active[static_cast<size_t>(i)]) continue;
+            for (int c : cols_by_row[static_cast<size_t>(i)]) {
+                if (col_active[static_cast<size_t>(c)]) {
+                    row_bitsets[static_cast<size_t>(i)].set(c);
+                    ++row_sizes[static_cast<size_t>(i)];
+                }
+            }
+            row_order.push_back(i);
         }
-        std::sort(active_cols_sorted[static_cast<size_t>(i)].begin(),
-                  active_cols_sorted[static_cast<size_t>(i)].end());
-        row_order.push_back(i);
-    }
-    std::sort(row_order.begin(), row_order.end(), [&](int a, int b) {
-        return active_cols_sorted[static_cast<size_t>(a)].size() <
-               active_cols_sorted[static_cast<size_t>(b)].size();
-    });
+        std::sort(row_order.begin(), row_order.end(), [&](int a, int b) {
+            return row_sizes[static_cast<size_t>(a)] < row_sizes[static_cast<size_t>(b)];
+        });
 
-    for (size_t ia = 0; ia < row_order.size(); ++ia) {
-        if (std::chrono::steady_clock::now() >= deadline) break;
-        const int a = row_order[ia];
-        if (!row_active[static_cast<size_t>(a)]) continue;
-        const auto &cols_a = active_cols_sorted[static_cast<size_t>(a)];
-        for (size_t ib = ia + 1; ib < row_order.size(); ++ib) {
-            const int b = row_order[ib];
-            if (!row_active[static_cast<size_t>(b)]) continue;
-            const auto &cols_b = active_cols_sorted[static_cast<size_t>(b)];
-            if (cols_a.size() > cols_b.size()) continue;
-            if (isSubsetSorted(cols_a, cols_b)) {
-                row_active[static_cast<size_t>(b)] = 0;
-                ++result.rows_removed;
+        for (size_t ia = 0; ia < row_order.size(); ++ia) {
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            const int a = row_order[ia];
+            if (!row_active[static_cast<size_t>(a)]) continue;
+            for (size_t ib = ia + 1; ib < row_order.size(); ++ib) {
+                const int b = row_order[ib];
+                if (!row_active[static_cast<size_t>(b)]) continue;
+                if (row_sizes[static_cast<size_t>(a)] > row_sizes[static_cast<size_t>(b)]) continue;
+                if (row_bitsets[static_cast<size_t>(a)].is_subset_of(row_bitsets[static_cast<size_t>(b)])) {
+                    row_active[static_cast<size_t>(b)] = 0;
+                    ++result.rows_removed;
+                }
             }
         }
     }
