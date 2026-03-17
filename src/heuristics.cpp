@@ -111,6 +111,17 @@ public:
         std::vector<char> fixed_one(static_cast<size_t>(ncols), 0);
         std::vector<double> coverage(static_cast<size_t>(nrows), 0.0);
 
+        // Build column-to-rows transpose and per-row coefficient lookup
+        struct ColRowEntry { int row; double val; };
+        std::vector<std::vector<ColRowEntry>> rows_by_col(static_cast<size_t>(ncols));
+        for (int i = 0; i < nrows; ++i) {
+            for (int k = base.csr_offs[static_cast<size_t>(i)]; k < base.csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                const int col = base.csr_inds[static_cast<size_t>(k)];
+                if (col >= 0 && col < ncols)
+                    rows_by_col[static_cast<size_t>(col)].push_back({i, base.csr_vals[static_cast<size_t>(k)]});
+            }
+        }
+
         for (const BranchDecision &d : branch_node.decisions) {
             if (d.var_index < 0 || d.var_index >= ncols) continue;
             if (d.fix_value == 0)
@@ -129,22 +140,27 @@ public:
             }
         }
 
-        auto recompute_coverage = [&]() {
-            std::fill(coverage.begin(), coverage.end(), 0.0);
-            for (int i = 0; i < nrows; ++i) {
-                for (int k = base.csr_offs[static_cast<size_t>(i)]; k < base.csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                    const int col = base.csr_inds[static_cast<size_t>(k)];
-                    if (col >= 0 && col < ncols && out.solution[static_cast<size_t>(col)] > 0.5) {
-                        coverage[static_cast<size_t>(i)] += base.csr_vals[static_cast<size_t>(k)];
-                    }
-                }
-            }
-        };
-
-        recompute_coverage();
+        // Compute initial coverage incrementally from selected columns
+        for (int j = 0; j < ncols; ++j) {
+            if (out.solution[static_cast<size_t>(j)] < 0.5) continue;
+            for (const auto &entry : rows_by_col[static_cast<size_t>(j)])
+                coverage[static_cast<size_t>(entry.row)] += entry.val;
+        }
 
         auto is_row_covered = [&](int row) {
             return coverage[static_cast<size_t>(row)] + tol >= base.rhs[static_cast<size_t>(row)];
+        };
+
+        // Add coverage from column j
+        auto add_col_coverage = [&](int j) {
+            for (const auto &entry : rows_by_col[static_cast<size_t>(j)])
+                coverage[static_cast<size_t>(entry.row)] += entry.val;
+        };
+
+        // Remove coverage from column j
+        auto remove_col_coverage = [&](int j) {
+            for (const auto &entry : rows_by_col[static_cast<size_t>(j)])
+                coverage[static_cast<size_t>(entry.row)] -= entry.val;
         };
 
         while (true) {
@@ -154,24 +170,18 @@ public:
             }
             if (uncovered < 0) break;
 
+            // Score each free column using its transpose entries (O(nnz) total)
             int best_col = -1;
             double best_score = -std::numeric_limits<double>::infinity();
             for (int j = 0; j < ncols; ++j) {
                 if (out.solution[static_cast<size_t>(j)] > 0.5 || fixed_zero[static_cast<size_t>(j)]) continue;
                 double uncovered_gain = 0.0;
                 double dual_gain = 0.0;
-                for (int i = 0; i < nrows; ++i) {
-                    if (is_row_covered(i)) continue;
-                    for (int k = base.csr_offs[static_cast<size_t>(i)]; k < base.csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                        if (base.csr_inds[static_cast<size_t>(k)] != j) continue;
-                        const double aij = base.csr_vals[static_cast<size_t>(k)];
-                        if (aij > 0.0) {
-                            uncovered_gain += aij;
-                            if (static_cast<int>(relaxed_dual.size()) > i)
-                                dual_gain += std::max(0.0, relaxed_dual[static_cast<size_t>(i)]) * aij;
-                        }
-                        break;
-                    }
+                for (const auto &entry : rows_by_col[static_cast<size_t>(j)]) {
+                    if (is_row_covered(entry.row) || entry.val <= 0.0) continue;
+                    uncovered_gain += entry.val;
+                    if (entry.row < static_cast<int>(relaxed_dual.size()))
+                        dual_gain += std::max(0.0, relaxed_dual[static_cast<size_t>(entry.row)]) * entry.val;
                 }
                 if (uncovered_gain <= 0.0) continue;
                 const double col_cost = std::max(1e-9, base.obj[static_cast<size_t>(j)]);
@@ -180,6 +190,7 @@ public:
             }
 
             if (best_col < 0) {
+                // Fallback: pick cheapest column covering any uncovered row
                 int fallback_col = -1;
                 double best_fallback_cost = std::numeric_limits<double>::infinity();
                 for (int i = 0; i < nrows; ++i) {
@@ -198,10 +209,10 @@ public:
                 best_col = fallback_col;
             }
             out.solution[static_cast<size_t>(best_col)] = 1.0;
-            recompute_coverage();
+            add_col_coverage(best_col);
         }
 
-        // Post-process: try removing unnecessary columns
+        // Post-process: try removing unnecessary columns (most expensive first)
         std::vector<int> selected;
         for (int j = 0; j < ncols; ++j) {
             if (out.solution[static_cast<size_t>(j)] > 0.5 && !fixed_one[static_cast<size_t>(j)]) {
@@ -213,14 +224,14 @@ public:
 
         for (int col : selected) {
             out.solution[static_cast<size_t>(col)] = 0.0;
-            recompute_coverage();
+            remove_col_coverage(col);
             bool feasible = true;
             for (int i = 0; i < nrows; ++i) {
                 if (!is_row_covered(i)) { feasible = false; break; }
             }
             if (!feasible) {
                 out.solution[static_cast<size_t>(col)] = 1.0;
-                recompute_coverage();
+                add_col_coverage(col);
             }
         }
 
