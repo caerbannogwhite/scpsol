@@ -22,7 +22,8 @@ add_executable(scpsol
     src/cuts.cpp
     src/balas.cpp
     src/bnb.cpp
-    src/reliability.cpp)
+    src/reliability.cpp
+    src/lagrangian.cpp)
 target_include_directories(scpsol PRIVATE src)
 target_link_libraries(scpsol PRIVATE highs)
 

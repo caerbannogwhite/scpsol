@@ -3,6 +3,7 @@
 #include "bnb.h"
 #include "cuts.h"
 #include "heuristics.h"
+#include "lagrangian.h"
 #include "lp.h"
 #include "preprocessor.h"
 #include "reliability.h"
@@ -657,6 +658,24 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     }
 
     // ================================================================
+    // Phase 3.5: Lagrangian relaxation (subgradient optimization)
+    // ================================================================
+    if (root_sol.solved && root_sol.optimal) {
+        const int lagr_max_iters = 500;
+        const double lagr_time_limit = 5.0;
+        auto lagr = lagrangian_relaxation(base, best_obj, root_sol.row_dual,
+                                          lagr_max_iters, lagr_time_limit, verbosity);
+
+        if (lagr.best_heuristic_obj < best_obj - tol &&
+            !lagr.best_solution.empty()) {
+            best_obj = lagr.best_heuristic_obj;
+            adopt_incumbent_solution(best_solution, lagr.best_solution,
+                                     base.ncols, ncols_input, base.active_to_original);
+            incumbent_source = "lagrangian";
+        }
+    }
+
+    // ================================================================
     // Phase 4-5: Post-LP reduction
     // ================================================================
     {
@@ -757,6 +776,59 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 fprintf(stderr, "  Iterative RC fixing: %d cols removed total\n", total_rc_removed);
         }
 
+        // Re-validate incumbent against current model after RC fixing.
+        // RC fixing may have removed columns that were in the incumbent,
+        // making the incumbent infeasible on the reduced model.
+        if (std::isfinite(best_obj) && !best_solution.empty()) {
+            // Check feasibility: every row must be covered by active incumbent columns
+            bool incumbent_valid = true;
+            double validated_obj = 0.0;
+            for (int j = 0; j < ncols; ++j) {
+                const int orig = active_to_input[static_cast<size_t>(j)];
+                if (orig >= 0 && orig < ncols_input &&
+                    best_solution[static_cast<size_t>(orig)] > 0.5)
+                    validated_obj += obj[static_cast<size_t>(j)];
+            }
+            for (int i = 0; i < nrows && incumbent_valid; ++i) {
+                double row_sum = 0.0;
+                for (int k = csr_offs[static_cast<size_t>(i)];
+                     k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                    const int c = csr_inds[static_cast<size_t>(k)];
+                    if (c >= 0 && c < ncols) {
+                        const int orig = active_to_input[static_cast<size_t>(c)];
+                        if (orig >= 0 && orig < ncols_input &&
+                            best_solution[static_cast<size_t>(orig)] > 0.5)
+                            row_sum += csr_vals[static_cast<size_t>(k)];
+                    }
+                }
+                if (row_sum < 1.0 - tol) incumbent_valid = false;
+            }
+            if (!incumbent_valid || validated_obj > best_obj + tol) {
+                if (verbosity >= 3)
+                    fprintf(stderr, "  Incumbent invalidated after RC fixing (valid=%d, obj %.6g -> %.6g)\n",
+                            incumbent_valid ? 1 : 0, best_obj, validated_obj);
+                if (incumbent_valid) {
+                    best_obj = validated_obj;
+                } else {
+                    // Incumbent infeasible on reduced model; re-run heuristics
+                    best_obj = std::numeric_limits<double>::infinity();
+                    if (root_sol.solved && root_sol.optimal) {
+                        BranchNodeState reval_node;
+                        for (const auto &h : heuristics) {
+                            auto hr = h->tryBuild(root_sol.col_value, root_sol.row_dual, base, reval_node, integ_tol);
+                            if (hr.feasible && hr.objective < best_obj - tol) {
+                                best_obj = hr.objective;
+                                adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
+                                incumbent_source = std::string("reval_") + hr.name;
+                            }
+                        }
+                    }
+                    if (verbosity >= 3)
+                        fprintf(stderr, "  Re-computed incumbent: %.6g (%s)\n", best_obj, incumbent_source.c_str());
+                }
+            }
+        }
+
         // LP-based probing: fix x_j=0, check if infeasible or bound > incumbent
         if (root_sol.solved && root_sol.optimal && std::isfinite(best_obj) && ncols <= 800) {
             const auto probe_start = Clock::now();
@@ -791,7 +863,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     ++total_lp_solves;
 
                     if (!probe_sol.solved || probe_sol.infeasible ||
-                        (probe_sol.optimal && probe_sol.primal_obj > best_obj - tol)) {
+                        (probe_sol.optimal && probe_sol.primal_obj > best_obj + tol)) {
                         probe_fix_one[static_cast<size_t>(j)] = 1;
                         ++probe_fixed;
                     }
@@ -808,7 +880,6 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     double probe_fixed_cost = 0.0;
                     double probe_incumbent_cost = 0.0;
                     std::vector<char> row_covered(static_cast<size_t>(nrows), 0);
-
                     for (int j = 0; j < ncols; ++j) {
                         if (!probe_fix_one[static_cast<size_t>(j)]) continue;
                         probe_fixed_cost += obj[static_cast<size_t>(j)];
