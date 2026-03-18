@@ -10,11 +10,11 @@ The scpsol solver implements three families of cutting planes: Chvátal-Gomory (
 
 ### 2.1 The LP Relaxation Gap
 
-The SCP LP relaxation replaces $x_j \in \{0,1\}$ with $0 \leq x_j \leq 1$. The optimal LP value $z_{LP}$ provides a lower bound on the integer optimum $z^*$. The *integrality gap* $z^* - z_{LP}$ determines the search effort: a tighter LP bound means fewer branch-and-bound nodes.
+The SCP LP relaxation replaces $x_j \in \{0,1\}$ with $0 \leq x_j \leq 1$. The optimal LP value $z_{LP}$ provides a lower bound on the integer optimum $z^*$. The _integrality gap_ $z^* - z_{LP}$ determines the search effort: a tighter LP bound means fewer branch-and-bound nodes.
 
 ### 2.2 Valid Inequalities
 
-A linear inequality $\alpha^T x \geq \beta$ is *valid* for the SCP if every feasible integer solution satisfies it. A valid inequality is *violated* by the current LP solution $\bar{x}$ if $\alpha^T \bar{x} < \beta$. Adding violated valid inequalities to the LP raises $z_{LP}$ without excluding any integer solution.
+A linear inequality $\alpha^T x \geq \beta$ is _valid_ for the SCP if every feasible integer solution satisfies it. A valid inequality is _violated_ by the current LP solution $\bar{x}$ if $\alpha^T \bar{x} < \beta$. Adding violated valid inequalities to the LP raises $z_{LP}$ without excluding any integer solution.
 
 ### 2.3 Reduced Costs
 
@@ -74,19 +74,20 @@ The pairwise approach can find cuts invisible to the single aggregation because 
 
 ### 4.1 Theory
 
-For the SCP, a *cover* is a minimal set of columns $C$ such that every feasible solution must include at least one column from $C$. The corresponding *cover inequality* is:
+For the SCP, a _cover_ is a minimal set of columns $C$ such that every feasible solution must include at least one column from $C$. The corresponding _cover inequality_ is:
 
 $$\sum_{j \in C} x_j \geq 1$$
 
 This is valid because if all columns in $C$ were set to zero, at least one row would be uncovered. Cover inequalities are the SCP analogue of knapsack cover cuts in general MIP.
 
-The challenge is finding covers that are *violated* by the current LP solution — that is, sets $C$ where $\sum_{j \in C} \bar{x}_j < 1$.
+The challenge is finding covers that are _violated_ by the current LP solution — that is, sets $C$ where $\sum_{j \in C} \bar{x}_j < 1$.
 
 ### 4.2 The Balas Additive Procedure (BCG)
 
 The Balas Cut Generation (BCG) algorithm, implemented in `balas_cut_generate()`, constructs violated cover cuts using an iterative additive procedure based on reduced costs. The algorithm is rooted in the work of Balas and Ho (1980) on set covering via cutting planes and subgradient optimization.
 
 **Inputs:**
+
 - LP primal and dual solutions
 - Reduced costs $\bar{c}_j$
 - Set $S$ of candidate variables: fractional ($\bar{x}_j > \epsilon$) with positive reduced cost ($\bar{c}_j > \epsilon$)
@@ -127,7 +128,7 @@ This is a fast fallback that catches simple violated covers from individual cons
 
 ### 5.1 Multi-Way Branching
 
-Beyond cut generation, the Balas additive procedure also generates *branch sets* for multi-way branching. The BBG algorithm (`balas_branch_generate()`) extends BCG to produce multiple disjoint sets $R_1, R_2, \ldots, R_p$, each defining a branch child.
+Beyond cut generation, the Balas additive procedure also generates _branch sets_ for multi-way branching. The BBG algorithm (`balas_branch_generate()`) extends BCG to produce multiple disjoint sets $R_1, R_2, \ldots, R_p$, each defining a branch child.
 
 **Algorithm (similar to BCG but accumulates sets):**
 
@@ -136,6 +137,7 @@ The iteration loop is analogous to BCG, but instead of building a single cut, ea
 **BR1 Multi-Way Branching:**
 
 The solver creates $p$ children from $p$ branch sets:
+
 - Child $k$ fixes all variables in $R_k$ to 0 (none of these columns selected)
 - Child $k$ adds cover constraints for all earlier sets: $\sum_{j \in R_i} x_j \geq 1$ for $i < k$
 
@@ -144,6 +146,7 @@ This partitions the search space: child $k$ corresponds to the scenario where se
 **Activation Criteria:**
 
 BR1 branching is only used when the sets provide sufficient diversification:
+
 - At least 3 sets produced ($p \geq 3$)
 - Total variables across sets exceed $p \log_2 p$ (diversity check)
 - At most 1 singleton set (sets of size 1 are just regular binary branching)
@@ -152,7 +155,7 @@ BR1 branching is only used when the sets provide sufficient diversification:
 
 ### 5.2 Stagnation-Triggered Balas
 
-During branch-and-bound, if the solver detects *stagnation* (no gap improvement for `gap_stagnation_window` nodes), it triggers aggressive Balas branching:
+During branch-and-bound, if the solver detects _stagnation_ (no gap improvement for `gap_stagnation_window` nodes), it triggers aggressive Balas branching:
 
 1. A frequency accumulator increments by `aggressive_balas_frequency` (default 0.6) at each stagnation event
 2. When the accumulator reaches 1.0, the next fractional node forces BBG with `force_balas = true`
@@ -177,7 +180,7 @@ After the standard cut rounds, an additional Balas cover cut phase generates bra
 
 **Cut Validation for Integer Objectives:**
 
-When all objective coefficients are integer, the LP bound can be tightened to $\lceil z_{LP} \rceil$. If the cut rounds improve the raw LP bound but the tightened (ceiled) bound doesn't change, the cuts are *rolled back* — they add LP rows without actually improving the effective bound, which wastes LP solve time in the BnB tree.
+When all objective coefficients are integer, the LP bound can be tightened to $\lceil z_{LP} \rceil$. If the cut rounds improve the raw LP bound but the tightened (ceiled) bound doesn't change, the cuts are _rolled back_ — they add LP rows without actually improving the effective bound, which wastes LP solve time in the BnB tree.
 
 ### 6.2 Mid-BnB Cuts
 
@@ -186,6 +189,7 @@ Mid-BnB cut generation is controlled by `mid_bnb_cut_frequency` (default 0.0 = d
 ### 6.3 Cut Storage
 
 Cuts are stored at two levels:
+
 - **Base model cuts** (`base.base_cuts`): persistent across all BnB nodes, added to the LP at every node solve
 - **Node cuts** (`node.cuts`): local to a subtree, used for Balas branch cover constraints
 
@@ -193,21 +197,21 @@ When columns are eliminated during mid-BnB preprocessing, all cuts are remapped 
 
 ## 7. Configuration
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `cuts_enabled` | `true` | Enable cut separation |
-| `cut_rounds_root` | `5` | Maximum cut rounds at root |
-| `max_cuts_per_round` | `100` | Maximum cuts added per round |
-| `mid_bnb_cut_frequency` | `0.0` | Mid-BnB cut frequency (0 = disabled) |
-| `mid_bnb_cut_rounds` | `3` | Rounds of mid-BnB cutting |
-| `balas_enabled` | `true` | Enable Balas branching |
-| `aggressive_balas_frequency` | `0.6` | Stagnation Balas trigger frequency |
-| `balas_max_branches` | `20` | Maximum BR1 children |
-| `gap_stagnation_window` | `50` | Nodes without improvement before stagnation |
+| Parameter                    | Default | Description                                 |
+| ---------------------------- | ------- | ------------------------------------------- |
+| `cuts_enabled`               | `true`  | Enable cut separation                       |
+| `cut_rounds_root`            | `5`     | Maximum cut rounds at root                  |
+| `max_cuts_per_round`         | `100`   | Maximum cuts added per round                |
+| `mid_bnb_cut_frequency`      | `0.0`   | Mid-BnB cut frequency (0 = disabled)        |
+| `mid_bnb_cut_rounds`         | `3`     | Rounds of mid-BnB cutting                   |
+| `balas_enabled`              | `true`  | Enable Balas branching                      |
+| `aggressive_balas_frequency` | `0.6`   | Stagnation Balas trigger frequency          |
+| `balas_max_branches`         | `20`    | Maximum BR1 children                        |
+| `gap_stagnation_window`      | `50`    | Nodes without improvement before stagnation |
 
 ## 8. References
 
-- E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. *Mathematical Programming Study*, 12:37–60, 1980.
-- V. Chvátal. Edmonds polytopes and a hierarchy of combinatorial problems. *Discrete Mathematics*, 4(4):305–337, 1973.
-- R. E. Gomory. Outline of an algorithm for integer solutions to linear programs. *Bulletin of the American Mathematical Society*, 64(5):275–278, 1958.
-- G. L. Nemhauser and L. A. Wolsey. *Integer and Combinatorial Optimization*. Wiley, 1988. Chapter II.2 (Chvátal-Gomory cuts) and Chapter II.3 (cover inequalities).
+- E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. _Mathematical Programming Study_, 12:37–60, 1980.
+- V. Chvátal. Edmonds polytopes and a hierarchy of combinatorial problems. _Discrete Mathematics_, 4(4):305–337, 1973.
+- R. E. Gomory. Outline of an algorithm for integer solutions to linear programs. _Bulletin of the American Mathematical Society_, 64(5):275–278, 1958.
+- G. L. Nemhauser and L. A. Wolsey. _Integer and Combinatorial Optimization_. Wiley, 1988. Chapter II.2 (Chvátal-Gomory cuts) and Chapter II.3 (cover inequalities).

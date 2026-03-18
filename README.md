@@ -5,6 +5,7 @@ A Set Covering Problem (SCP) solver built from scratch in C++17, using [HiGHS](h
 ## Features
 
 **Preprocessing**
+
 - Iterated fixpoint reduction: essential column fixing, row domination, single/two-column dominance, cost-driven replacement
 - Greedy multi-column dominance finder with pipeline reordering
 - Budget pruning using incumbent bound
@@ -12,6 +13,7 @@ A Set Covering Problem (SCP) solver built from scratch in C++17, using [HiGHS](h
 - Probing-based row reduction
 
 **Branch-and-Bound**
+
 - Best-bound node selection (priority queue)
 - Reliability branching with pseudocost tracking and strong branching with propagation
 - Balas additive multi-way branching (stagnation-triggered)
@@ -19,11 +21,13 @@ A Set Covering Problem (SCP) solver built from scratch in C++17, using [HiGHS](h
 - Mid-BnB cut generation and column removal
 
 **Cuts**
+
 - Chvatal-Gomory cuts (dual-aggregated and row-pair separators)
 - Balas cover inequalities (additive procedure)
 - Root cut rounds with bound-improvement validation
 
 **Heuristics**
+
 - Chvatal greedy heuristic with redundancy removal (initial incumbent)
 - Nearest-integer fixing
 - Dual-guided cover repair with incremental coverage
@@ -32,13 +36,13 @@ A Set Covering Problem (SCP) solver built from scratch in C++17, using [HiGHS](h
 
 All instances solved to proven optimality with 0% MIP gap (300s time limit, single-threaded):
 
-| Category | Instances | Total Time | Avg Nodes |
-|----------|-----------|------------|-----------|
-| scp4 (10) | 10/10 | 0.4s | 3 |
-| scp5 (10) | 10/10 | 0.6s | 4 |
-| scpa (5) | 5/5 | 5.4s | 50 |
-| scpb (5) | 5/5 | 19.0s | 262 |
-| **Core 30** | **30/30** | **25.4s** | — |
+| Category    | Instances | Total Time | Avg Nodes |
+| ----------- | --------- | ---------- | --------- |
+| scp4 (10)   | 10/10     | 0.4s       | 3         |
+| scp5 (10)   | 10/10     | 0.6s       | 4         |
+| scpa (5)    | 5/5       | 5.4s       | 50        |
+| scpb (5)    | 5/5       | 19.0s      | 262       |
+| **Core 30** | **30/30** | **25.4s**  | —         |
 
 On harder NRE/NRF instances (500 rows, 5000 cols): 7/10 optimal, max residual gap 7.1%.
 
@@ -72,19 +76,19 @@ HiGHS v1.9.0 is fetched automatically via CMake FetchContent.
 
 ### Options
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--verbosity N` | Verbosity level (0=silent, 1=summary, 2=progress) | `2` |
-| `--max-nodes N` | Maximum BnB nodes | `100000` |
-| `--time-limit S` | Time limit in seconds | `0` (unlimited) |
-| `--branch STRATEGY` | Branch strategy: `reliability`, `most_fractional`, `highest_cost` | `reliability` |
-| `--reliability-eta N` | Min observations before trusting pseudocosts | `4` |
-| `--reliability-sb N` | Max strong-branch probes per node | `8` |
-| `--cut-frequency F` | Mid-BnB cut frequency 0.0-1.0 (0=disable) | `0.0` |
-| `--balas-frequency F` | Balas branching frequency 0.0-1.0 (0=disable) | `0.6` |
-| `--cut-rounds N` | Mid-BnB cut rounds per event | `3` |
-| `--preprocess RULES` | Preprocess rules | `"single,two"` |
-| `--show-solution` | Print selected columns | |
+| Flag                  | Description                                                       | Default         |
+| --------------------- | ----------------------------------------------------------------- | --------------- |
+| `--verbosity N`       | Verbosity level (0=silent, 1=summary, 2=progress)                 | `2`             |
+| `--max-nodes N`       | Maximum BnB nodes                                                 | `100000`        |
+| `--time-limit S`      | Time limit in seconds                                             | `0` (unlimited) |
+| `--branch STRATEGY`   | Branch strategy: `reliability`, `most_fractional`, `highest_cost` | `reliability`   |
+| `--reliability-eta N` | Min observations before trusting pseudocosts                      | `4`             |
+| `--reliability-sb N`  | Max strong-branch probes per node                                 | `8`             |
+| `--cut-frequency F`   | Mid-BnB cut frequency 0.0-1.0 (0=disable)                         | `0.0`           |
+| `--balas-frequency F` | Balas branching frequency 0.0-1.0 (0=disable)                     | `0.6`           |
+| `--cut-rounds N`      | Mid-BnB cut rounds per event                                      | `3`             |
+| `--preprocess RULES`  | Preprocess rules                                                  | `"single,two"`  |
+| `--show-solution`     | Print selected columns                                            |                 |
 
 ### Example
 

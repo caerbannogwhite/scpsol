@@ -20,9 +20,9 @@ where $c_j > 0$ is the cost of column $j$, $S_i$ is the set of columns that cove
 
 ### 3.1 Essential Column Fixing
 
-**Theory.** A column $j$ is *essential* for row $i$ if it is the only column that can cover $i$, i.e., $S_i = \{j\}$. In any feasible solution, $x_j = 1$ must hold. Fixing $x_j = 1$ allows removing all rows in $R_j$ from the problem, since they are now guaranteed to be covered.
+**Theory.** A column $j$ is _essential_ for row $i$ if it is the only column that can cover $i$, i.e., $S_i = \{j\}$. In any feasible solution, $x_j = 1$ must hold. Fixing $x_j = 1$ allows removing all rows in $R_j$ from the problem, since they are now guaranteed to be covered.
 
-Crucially, removing rows can make other columns essential. If column $k$ was one of two columns covering row $i'$, and the other column was just fixed, then $k$ becomes essential for $i'$. This creates a *cascade* of fixings.
+Crucially, removing rows can make other columns essential. If column $k$ was one of two columns covering row $i'$, and the other column was just fixed, then $k$ becomes essential for $i'$. This creates a _cascade_ of fixings.
 
 **Implementation.** The essential column cascade in `row_reduce()` (`src/preprocessor.cpp`) iterates until quiescence:
 
@@ -40,13 +40,13 @@ The fixed columns' costs are accumulated in `fixed_preprocess_cost` and subtract
 
 ### 3.2 Row Domination
 
-**Theory.** Row $i$ *dominates* row $i'$ if every column covering $i$ also covers $i'$, i.e., $S_i \subseteq S_{i'}$. Any feasible solution that satisfies the constraint for $i$ automatically satisfies the constraint for $i'$, so $i'$ is redundant and can be removed.
+**Theory.** Row $i$ _dominates_ row $i'$ if every column covering $i$ also covers $i'$, i.e., $S_i \subseteq S_{i'}$. Any feasible solution that satisfies the constraint for $i$ automatically satisfies the constraint for $i'$, so $i'$ is redundant and can be removed.
 
 **Implementation.** In `row_reduce()`, active rows are sorted by coverage size (ascending), and for each pair $(i, i')$ where $|S_i| \leq |S_{i'}|$, a bitset subset check determines if $S_i \subseteq S_{i'}$. If so, $i'$ is deactivated. The bitset representation uses $\lceil n/64 \rceil$ words per row (where $n$ is the number of columns), enabling fast subset checks even for large instances.
 
 ### 3.3 Probing (Constraint Propagation)
 
-**Theory.** For each active column $j$, we temporarily assume $x_j = 0$ and propagate the consequences via the essential column cascade. If this leads to a row with no remaining covering columns (infeasibility), then $x_j = 0$ is impossible in any feasible solution, so $x_j = 1$ must hold. This is equivalent to a single round of *node presolve* or *probing* in MIP solvers.
+**Theory.** For each active column $j$, we temporarily assume $x_j = 0$ and propagate the consequences via the essential column cascade. If this leads to a row with no remaining covering columns (infeasibility), then $x_j = 0$ is impossible in any feasible solution, so $x_j = 1$ must hold. This is equivalent to a single round of _node presolve_ or _probing_ in MIP solvers.
 
 More formally: setting $x_j = 0$ may force other columns to be essential (creating $x_k = 1$), which removes rows and may make further columns essential. If the cascade reaches a contradiction (an uncoverable row), the original assumption $x_j = 0$ is refuted.
 
@@ -61,7 +61,7 @@ After all probing, a final essential column cascade picks up any newly created e
 
 ### 3.4 Single Column Dominance
 
-**Theory.** Column $j$ is *dominated* by column $k$ if $c_k \leq c_j$ and $R_j \subseteq R_k$ — that is, $k$ covers all the rows that $j$ covers, at no greater cost. In any optimal solution that uses $j$, replacing $j$ with $k$ yields a solution that is at least as good. Therefore $j$ can be removed.
+**Theory.** Column $j$ is _dominated_ by column $k$ if $c_k \leq c_j$ and $R_j \subseteq R_k$ — that is, $k$ covers all the rows that $j$ covers, at no greater cost. In any optimal solution that uses $j$, replacing $j$ with $k$ yields a solution that is at least as good. Therefore $j$ can be removed.
 
 **Implementation.** The `SingleColumnDominanceRule` checks every pair of active columns. For each target column $j$, if any candidate $k$ has $c_k \leq c_j$ and $R_j \subseteq R_k$, then $j$ is deactivated. Tie-breaking: if costs are equal, the lower-indexed column is kept.
 
@@ -69,7 +69,7 @@ After all probing, a final essential column cascade picks up any newly created e
 
 ### 3.5 Two-Column Dominance
 
-**Theory.** Column $j$ is *pair-dominated* if there exist columns $k_1, k_2$ such that $c_{k_1} + c_{k_2} < c_j$ and $R_j \subseteq R_{k_1} \cup R_{k_2}$. Any solution using $j$ can be improved by using $k_1$ and $k_2$ instead, so $j$ is redundant.
+**Theory.** Column $j$ is _pair-dominated_ if there exist columns $k_1, k_2$ such that $c_{k_1} + c_{k_2} < c_j$ and $R_j \subseteq R_{k_1} \cup R_{k_2}$. Any solution using $j$ can be improved by using $k_1$ and $k_2$ instead, so $j$ is redundant.
 
 **Implementation.** The `TwoColumnDominanceRule` iterates over all target columns and all pairs of candidates. Time limit checks prevent excessive computation on large instances.
 
@@ -103,6 +103,7 @@ The algorithm follows the structure of Algorithm 1 from Grossman & Wool (1997):
 3. If all rows are covered within budget $c_{\hat{j}}$, remove $\hat{j}$.
 
 **Key implementation details:**
+
 - Maintains a reverse index `tilde_cols_by_row` (updated incrementally as $\tilde{N}$ grows).
 - Uses reusable `uncovered` and `is_candidate` buffers to avoid per-column allocation.
 - Worst-case $O(|\hat{N}| \cdot |\tilde{N}| \cdot \text{avg\_rows})$ but very fast in practice ($< 0.1$s on 3000-column instances).
@@ -119,7 +120,7 @@ The budget for column $j$ is $B_j = \lfloor z^* \rfloor - 1 - \lfloor c_j \rfloo
 
 ### 3.9 Reduced-Cost Fixing
 
-**Theory.** After solving the LP relaxation with dual bound $z_{LP}$ and incumbent $z^*$, the *gap* is $\Delta = z^* - z_{LP}$. For any column $j$ with LP value $x_j = 0$ and reduced cost $\bar{c}_j > \Delta$, fixing $x_j = 1$ would increase the LP bound beyond $z^*$, so $x_j = 0$ in every optimal solution. This is a standard technique in mixed-integer programming.
+**Theory.** After solving the LP relaxation with dual bound $z_{LP}$ and incumbent $z^*$, the _gap_ is $\Delta = z^* - z_{LP}$. For any column $j$ with LP value $x_j = 0$ and reduced cost $\bar{c}_j > \Delta$, fixing $x_j = 1$ would increase the LP bound beyond $z^*$, so $x_j = 0$ in every optimal solution. This is a standard technique in mixed-integer programming.
 
 **Implementation.** In `solver.cpp` (Phase 4-5), reduced costs are computed from the LP dual solution. Columns at their lower bound ($x_j \approx 0$) with $\bar{c}_j > \Delta + \epsilon$ are removed.
 
@@ -133,7 +134,7 @@ The budget for column $j$ is $B_j = \lfloor z^* \rfloor - 1 - \lfloor c_j \rfloo
 
 ### 4.1 Theory
 
-The greedy algorithm by Chvátal (1979) provides an initial feasible solution and upper bound. At each iteration, it selects the column with the best *cost-effectiveness ratio*:
+The greedy algorithm by Chvátal (1979) provides an initial feasible solution and upper bound. At each iteration, it selects the column with the best _cost-effectiveness ratio_:
 
 $$j^* = \arg\max_{j} \frac{|\{i \in R_j : i \text{ uncovered}\}|}{c_j}$$
 
@@ -167,7 +168,7 @@ The heuristic uses a **column-to-rows transpose** (built once per invocation) an
 
 ### 5.1 Iterated Fixpoint
 
-A key design principle in scpsol is that preprocessing techniques are *iterated until fixpoint*. Each technique can enable further reductions by others:
+A key design principle in scpsol is that preprocessing techniques are _iterated until fixpoint_. Each technique can enable further reductions by others:
 
 - **Essential columns → dominance**: Fixing essential columns and removing their rows can make previously non-dominated columns now dominated.
 - **Dominance → essential columns**: Removing dominated columns can leave rows with only one covering column, creating new essentials.
@@ -181,11 +182,13 @@ The preprocessing loop runs all techniques in sequence and repeats the entire se
 The full preprocessing pipeline in `solver.cpp` proceeds as follows:
 
 **Phase 1: Greedy Heuristic**
+
 - Compute initial feasible solution and upper bound $z^*$
 - Post-process with redundancy removal (remove unnecessary columns, most expensive first)
 
 **Phase 2: Pre-LP Reduction (iterated)**
 Repeat until fixpoint:
+
 1. Cost reduction (remove columns with $c_j \geq z^*$)
 2. Incumbent budget pruning
 3. **Greedy multi-column dominance finder** (see §3.10)
@@ -193,15 +196,17 @@ Repeat until fixpoint:
 5. Configured dominance rules (single, two-column)
 6. Row reduction (essential columns, row domination, probing)
 
-*Note:* The greedy dominance finder (step 3) runs before the expensive pairwise/triplet checks (steps 4-5). This is critical for performance: it reduces the column count by 50-85% with negligible overhead, so the subsequent $O(n^2)$ and $O(n^3)$ rules operate on a much smaller problem.
+_Note:_ The greedy dominance finder (step 3) runs before the expensive pairwise/triplet checks (steps 4-5). This is critical for performance: it reduces the column count by 50-85% with negligible overhead, so the subsequent $O(n^2)$ and $O(n^3)$ rules operate on a much smaller problem.
 
 **Phase 3: Root LP Relaxation**
+
 - Solve LP relaxation on the reduced problem
 - Try heuristics on root LP solution
 - Record dual bound
 
 **Phase 4-5: Post-LP Reduction (iterated)**
 Repeat until fixpoint:
+
 1. Reduced-cost fixing (using LP duals and gap)
 2. Cost reduction
 3. Incumbent budget pruning
@@ -209,6 +214,7 @@ Repeat until fixpoint:
 5. Row reduction
 
 **Phase 6: Branch-and-Bound**
+
 - Build final base model from reduced problem
 - During BnB, mid-solve reductions triggered on incumbent improvement:
   - Cost-based column removal
@@ -222,12 +228,12 @@ When a new incumbent is found during branch-and-bound, the tighter bound enables
 
 The `DynBitset` utility (`src/bitset_util.h`) provides a lightweight, variable-width bitset supporting subset and union-subset operations:
 
-| Operation | Complexity | Use |
-|-----------|-----------|-----|
-| `is_subset_of(other)` | $O(\lceil n/64 \rceil)$ | Column dominance |
-| `is_subset_of_union(a, b)` | $O(\lceil n/64 \rceil)$ | Two-column dominance |
+| Operation                      | Complexity              | Use                               |
+| ------------------------------ | ----------------------- | --------------------------------- |
+| `is_subset_of(other)`          | $O(\lceil n/64 \rceil)$ | Column dominance                  |
+| `is_subset_of_union(a, b)`     | $O(\lceil n/64 \rceil)$ | Two-column dominance              |
 | `is_subset_of_union3(a, b, c)` | $O(\lceil n/64 \rceil)$ | Cost-driven replacement (triples) |
-| `popcount()` | $O(\lceil n/64 \rceil)$ | Coverage counting |
+| `popcount()`                   | $O(\lceil n/64 \rceil)$ | Coverage counting                 |
 
 For standard benchmark instances with $m = 200$-$300$ rows, this means 4-5 uint64 word operations per check, replacing $O(|R_j|)$ sorted-merge operations. The `build_column_bitsets()` helper builds bitsets for all active columns from the `rows_by_column` transpose.
 
@@ -238,6 +244,7 @@ During branch-and-bound, scpsol applies lightweight preprocessing at each node:
 ### 7.1 Node-Level Propagation
 
 Before solving a node's LP relaxation, the `propagate_fixings()` function (from `src/reliability.cpp`) runs an essential-column cascade on the node's fixed variables. This can:
+
 - Detect infeasible nodes without an LP solve (when a row has no free columns)
 - Discover implied fixings that tighten the LP
 
@@ -251,16 +258,16 @@ After solving a node's LP, the solver computes reduced costs and fixes variables
 
 The preprocessing behavior is controlled by the `SolverConfig` fields:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `preprocess_rules` | `"single,two"` | Comma-separated list of dominance rules |
-| `preprocess_time_limit` | `10.0` | Time limit (seconds) per preprocessing phase |
+| Parameter               | Default        | Description                                  |
+| ----------------------- | -------------- | -------------------------------------------- |
+| `preprocess_rules`      | `"single,two"` | Comma-separated list of dominance rules      |
+| `preprocess_time_limit` | `10.0`         | Time limit (seconds) per preprocessing phase |
 
 Available rule tokens: `single` (single column dominance), `two` (two-column dominance), `cost_driven` (cost-driven replacement), `incumbent_budget` (budget pruning), `none` (disable all).
 
 ## 9. References
 
-- V. Chvátal. A greedy heuristic for the set-covering problem. *Mathematics of Operations Research*, 4(3):233–235, 1979.
-- E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. *Mathematical Programming Study*, 12:37–60, 1980.
-- T. Achterberg, T. Koch, and A. Martin. Constraint integer programming: a new approach to integrate CP and MIP. *LNCS*, 3011:6–20, 2004.
-- M. Savelsbergh. Preprocessing and probing techniques for mixed integer programming problems. *ORSA Journal on Computing*, 6(4):445–454, 1994.
+- V. Chvátal. A greedy heuristic for the set-covering problem. _Mathematics of Operations Research_, 4(3):233–235, 1979.
+- E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. _Mathematical Programming Study_, 12:37–60, 1980.
+- T. Achterberg, T. Koch, and A. Martin. Constraint integer programming: a new approach to integrate CP and MIP. _LNCS_, 3011:6–20, 2004.
+- M. Savelsbergh. Preprocessing and probing techniques for mixed integer programming problems. _ORSA Journal on Computing_, 6(4):445–454, 1994.

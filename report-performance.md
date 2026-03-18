@@ -19,13 +19,13 @@ The initial solver implemented a straightforward branch-and-bound with LP relaxa
 
 ### 2.2 Baseline Results
 
-| Category | Instances | Time | Nodes |
-|----------|-----------|------|-------|
-| scp4 (10) | 10/10 optimal | ~2s | ~50 |
-| scp5 (10) | 10/10 optimal | ~5s | ~80 |
-| scpa (5) | 5/5 optimal | 199.5s | 804 |
-| scpb (5) | 5/5 optimal | 2346.9s | 10480 |
-| **Total** | **30/30** | **~2553s** | **~11414** |
+| Category  | Instances     | Time       | Nodes      |
+| --------- | ------------- | ---------- | ---------- |
+| scp4 (10) | 10/10 optimal | ~2s        | ~50        |
+| scp5 (10) | 10/10 optimal | ~5s        | ~80        |
+| scpa (5)  | 5/5 optimal   | 199.5s     | 804        |
+| scpb (5)  | 5/5 optimal   | 2346.9s    | 10480      |
+| **Total** | **30/30**     | **~2553s** | **~11414** |
 
 The B-set instances dominated runtime, with scpb4 alone taking 1544 seconds and 6939 nodes.
 
@@ -83,9 +83,9 @@ Combined preprocessing, cuts, and Balas branching reduced total time to ~317s (s
 ### 6.2 Impact
 
 | Category | Before (Balas+Preproc) | After (Reliability) | Node Reduction |
-|----------|------------------------|---------------------|----------------|
-| scpa (5) | 815 nodes, 84.9s | 353 nodes, 83.7s | 2.3x fewer |
-| scpb (5) | 10058 nodes, 232.4s | 1579 nodes, 134.8s | 6.4x fewer |
+| -------- | ---------------------- | ------------------- | -------------- |
+| scpa (5) | 815 nodes, 84.9s       | 353 nodes, 83.7s    | 2.3x fewer     |
+| scpb (5) | 10058 nodes, 232.4s    | 1579 nodes, 134.8s  | 6.4x fewer     |
 
 The most dramatic improvement was on scpb4: from 6541 nodes to 713 nodes (9.2x reduction). Total time dropped from ~317s to ~219s.
 
@@ -135,13 +135,13 @@ Profiling revealed that on scpb4, cost-driven replacement took 10.0s and single/
 
 ### 9.3 Impact
 
-| Category | Before (Phase 7) | After (Phase 8) | Speedup |
-|----------|-------------------|------------------|---------|
-| scp4 (10) | 1.16s | 0.34s | 71% |
-| scp5 (10) | 3.96s | 0.60s | 85% |
-| scpa (5) | 28.80s | 5.17s | 82% |
-| scpb (5) | 93.56s | 18.79s | 80% |
-| **Total** | **127.5s** | **24.9s** | **80%** |
+| Category  | Before (Phase 7) | After (Phase 8) | Speedup |
+| --------- | ---------------- | --------------- | ------- |
+| scp4 (10) | 1.16s            | 0.34s           | 71%     |
+| scp5 (10) | 3.96s            | 0.60s           | 85%     |
+| scpa (5)  | 28.80s           | 5.17s           | 82%     |
+| scpb (5)  | 93.56s           | 18.79s          | 80%     |
+| **Total** | **127.5s**       | **24.9s**       | **80%** |
 
 ## 10. Final Benchmark Results
 
@@ -150,47 +150,47 @@ Current solver performance on all 30 OR-Library instances (all optimal, 0% MIP g
 ### 10.1 Per-Instance Results
 
 | Instance | Primal | Nodes | LP Solves | Time (s) |
-|----------|--------|-------|-----------|----------|
-| scp41 | 429 | 0 | 3 | 0.015 |
-| scp42 | 512 | 0 | 3 | 0.022 |
-| scp43 | 516 | 0 | 3 | 0.028 |
-| scp44 | 494 | 0 | 3 | 0.020 |
-| scp45 | 512 | 0 | 3 | 0.028 |
-| scp46 | 560 | 9 | 76 | 0.052 |
-| scp47 | 430 | 0 | 3 | 0.028 |
-| scp48 | 492 | 7 | 58 | 0.048 |
-| scp49 | 641 | 11 | 126 | 0.113 |
-| scp410 | 514 | 3 | 18 | 0.019 |
-| scp51 | 253 | 11 | 142 | 0.114 |
-| scp52 | 302 | 14 | 205 | 0.199 |
-| scp53 | 226 | 0 | 3 | 0.025 |
-| scp54 | 242 | 6 | 89 | 0.061 |
-| scp55 | 211 | 0 | 3 | 0.019 |
-| scp56 | 213 | 0 | 3 | 0.020 |
-| scp57 | 293 | 3 | 38 | 0.042 |
-| scp58 | 288 | 8 | 67 | 0.066 |
-| scp59 | 279 | 0 | 3 | 0.029 |
-| scp510 | 265 | 0 | 3 | 0.028 |
-| scpa1 | 253 | 45 | 608 | 1.065 |
-| scpa2 | 252 | 105 | 1088 | 1.965 |
-| scpa3 | 232 | 65 | 944 | 1.517 |
-| scpa4 | 234 | 18 | 261 | 0.391 |
-| scpa5 | 236 | 17 | 174 | 0.295 |
-| scpb1 | 69 | 97 | 888 | 2.319 |
-| scpb2 | 76 | 273 | 1460 | 4.425 |
-| scpb3 | 80 | 142 | 1213 | 2.814 |
-| scpb4 | 79 | 721 | 1966 | 6.672 |
-| scpb5 | 72 | 75 | 834 | 1.844 |
+| -------- | ------ | ----- | --------- | -------- |
+| scp41    | 429    | 0     | 3         | 0.015    |
+| scp42    | 512    | 0     | 3         | 0.022    |
+| scp43    | 516    | 0     | 3         | 0.028    |
+| scp44    | 494    | 0     | 3         | 0.020    |
+| scp45    | 512    | 0     | 3         | 0.028    |
+| scp46    | 560    | 9     | 76        | 0.052    |
+| scp47    | 430    | 0     | 3         | 0.028    |
+| scp48    | 492    | 7     | 58        | 0.048    |
+| scp49    | 641    | 11    | 126       | 0.113    |
+| scp410   | 514    | 3     | 18        | 0.019    |
+| scp51    | 253    | 11    | 142       | 0.114    |
+| scp52    | 302    | 14    | 205       | 0.199    |
+| scp53    | 226    | 0     | 3         | 0.025    |
+| scp54    | 242    | 6     | 89        | 0.061    |
+| scp55    | 211    | 0     | 3         | 0.019    |
+| scp56    | 213    | 0     | 3         | 0.020    |
+| scp57    | 293    | 3     | 38        | 0.042    |
+| scp58    | 288    | 8     | 67        | 0.066    |
+| scp59    | 279    | 0     | 3         | 0.029    |
+| scp510   | 265    | 0     | 3         | 0.028    |
+| scpa1    | 253    | 45    | 608       | 1.065    |
+| scpa2    | 252    | 105   | 1088      | 1.965    |
+| scpa3    | 232    | 65    | 944       | 1.517    |
+| scpa4    | 234    | 18    | 261       | 0.391    |
+| scpa5    | 236    | 17    | 174       | 0.295    |
+| scpb1    | 69     | 97    | 888       | 2.319    |
+| scpb2    | 76     | 273   | 1460      | 4.425    |
+| scpb3    | 80     | 142   | 1213      | 2.814    |
+| scpb4    | 79     | 721   | 1966      | 6.672    |
+| scpb5    | 72     | 75    | 834       | 1.844    |
 
 ### 10.2 Summary by Category
 
-| Category | Instances | Avg Time | Total Time | Avg Nodes | Max Nodes |
-|----------|-----------|----------|------------|-----------|-----------|
-| scp4 (10) | 10/10 | 0.037s | 0.37s | 3.0 | 11 |
-| scp5 (10) | 10/10 | 0.060s | 0.60s | 4.2 | 14 |
-| scpa (5) | 5/5 | 1.047s | 5.23s | 50.0 | 105 |
-| scpb (5) | 5/5 | 3.615s | 18.07s | 261.6 | 721 |
-| **Total** | **30/30** | **0.830s** | **24.27s** | — | 721 |
+| Category  | Instances | Avg Time   | Total Time | Avg Nodes | Max Nodes |
+| --------- | --------- | ---------- | ---------- | --------- | --------- |
+| scp4 (10) | 10/10     | 0.037s     | 0.37s      | 3.0       | 11        |
+| scp5 (10) | 10/10     | 0.060s     | 0.60s      | 4.2       | 14        |
+| scpa (5)  | 5/5       | 1.047s     | 5.23s      | 50.0      | 105       |
+| scpb (5)  | 5/5       | 3.615s     | 18.07s     | 261.6     | 721       |
+| **Total** | **30/30** | **0.830s** | **24.27s** | —         | 721       |
 
 ### 10.3 Notable Characteristics
 
@@ -200,16 +200,16 @@ Current solver performance on all 30 OR-Library instances (all optimal, 0% MIP g
 
 ## 11. Cumulative Speedup Summary
 
-| Phase | Key Technique | Total Time | Cumulative Speedup |
-|-------|--------------|------------|-------------------|
-| 1. Baseline | None | ~2553s | 1x |
-| 2. Preprocessing | Iterated dominance + pruning | ~850s | 3x |
-| 3. Cuts | CG + Balas cover cuts | ~500s | 5x |
-| 4. Balas branching | Multi-way + stagnation | ~317s | 8x |
-| 5. Reliability branching | Pseudocost + strong branch | ~219s | 12x |
-| 6. Bitset acceleration | O(m/64) subset checks | ~180s | 14x |
-| 7. Best-bound + node opts | Priority queue + propagation | ~128s | 20x |
-| 8. Dominance finder + caching | Greedy DF + pipeline reorder | ~25s | **102x** |
+| Phase                         | Key Technique                | Total Time | Cumulative Speedup |
+| ----------------------------- | ---------------------------- | ---------- | ------------------ |
+| 1. Baseline                   | None                         | ~2553s     | 1x                 |
+| 2. Preprocessing              | Iterated dominance + pruning | ~850s      | 3x                 |
+| 3. Cuts                       | CG + Balas cover cuts        | ~500s      | 5x                 |
+| 4. Balas branching            | Multi-way + stagnation       | ~317s      | 8x                 |
+| 5. Reliability branching      | Pseudocost + strong branch   | ~219s      | 12x                |
+| 6. Bitset acceleration        | O(m/64) subset checks        | ~180s      | 14x                |
+| 7. Best-bound + node opts     | Priority queue + propagation | ~128s      | 20x                |
+| 8. Dominance finder + caching | Greedy DF + pipeline reorder | ~25s       | **102x**           |
 
 ## 12. Architecture Overview
 
@@ -259,8 +259,8 @@ Input (.scp file)
 
 ## 13. References
 
-- E. Beasley. OR-Library: distributing test problems by electronic mail. *Journal of the Operational Research Society*, 41(11):1069-1072, 1990.
-- T. Grossman and A. Wool. Computational experience with approximation algorithms for the set covering problem. *European Journal of Operational Research*, 101(1):81-92, 1997.
-- V. Chvatal. A greedy heuristic for the set-covering problem. *Mathematics of Operations Research*, 4(3):233-235, 1979.
-- T. Achterberg, T. Koch, A. Martin. Branching rules revisited. *Operations Research Letters*, 33(1):42-54, 2005.
-- E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. *Mathematical Programming Study*, 12:37-60, 1980.
+- E. Beasley. OR-Library: distributing test problems by electronic mail. _Journal of the Operational Research Society_, 41(11):1069-1072, 1990.
+- T. Grossman and A. Wool. Computational experience with approximation algorithms for the set covering problem. _European Journal of Operational Research_, 101(1):81-92, 1997.
+- V. Chvatal. A greedy heuristic for the set-covering problem. _Mathematics of Operations Research_, 4(3):233-235, 1979.
+- T. Achterberg, T. Koch, A. Martin. Branching rules revisited. _Operations Research Letters_, 33(1):42-54, 2005.
+- E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. _Mathematical Programming Study_, 12:37-60, 1980.

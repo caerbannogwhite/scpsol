@@ -8,7 +8,7 @@ This report describes the branching strategies implemented in scpsol, the theory
 
 ## 2. Background: Branching Variable Selection
 
-Given an LP relaxation solution where variable $x_j$ has fractional value $f_j \in (0, 1)$, branching creates two child nodes: one with $x_j = 0$ and one with $x_j = 1$. The key question is: *which* fractional variable should we branch on?
+Given an LP relaxation solution where variable $x_j$ has fractional value $f_j \in (0, 1)$, branching creates two child nodes: one with $x_j = 0$ and one with $x_j = 1$. The key question is: _which_ fractional variable should we branch on?
 
 ### 2.1 Simple Heuristics
 
@@ -20,7 +20,7 @@ Both heuristics were implemented in scpsol as `MostFractionalSelector` and `High
 
 ### 2.2 Strong Branching
 
-Strong branching (SB) evaluates each candidate by *actually solving* the two child LPs. For each fractional variable $j$:
+Strong branching (SB) evaluates each candidate by _actually solving_ the two child LPs. For each fractional variable $j$:
 
 1. Fix $x_j = 0$, solve the LP, record the dual bound gain $D^-_j = z^-_j - z_{\text{parent}}$
 2. Fix $x_j = 1$, solve the LP, record the dual bound gain $D^+_j = z^+_j - z_{\text{parent}}$
@@ -30,13 +30,13 @@ The variable with the best combined score is selected. The standard scoring func
 
 $$\text{score}(j) = \max(\epsilon, D^-_j) \cdot \max(\epsilon, D^+_j)$$
 
-where $\epsilon$ is a small constant (e.g., $10^{-6}$) to avoid zero products. This score favors variables that improve *both* child bounds, preferring balanced improvements over one-sided ones.
+where $\epsilon$ is a small constant (e.g., $10^{-6}$) to avoid zero products. This score favors variables that improve _both_ child bounds, preferring balanced improvements over one-sided ones.
 
 Full strong branching produces the smallest search trees among standard branching rules, but the computational cost is prohibitive: solving $2|F|$ LPs at every node (where $|F|$ is the number of fractional variables) often makes the per-node overhead exceed the tree size savings.
 
 ### 2.3 Pseudocost Branching
 
-Pseudocost branching avoids the cost of solving probe LPs by maintaining *historical statistics* of how much each variable's branching improved the dual bound in the past.
+Pseudocost branching avoids the cost of solving probe LPs by maintaining _historical statistics_ of how much each variable's branching improved the dual bound in the past.
 
 For each variable $j$, we track:
 
@@ -47,11 +47,11 @@ At a new node, the estimated gains are:
 
 $$\hat{D}^-_j = f_j \cdot \sigma^-_j, \quad \hat{D}^+_j = (1 - f_j) \cdot \sigma^+_j$$
 
-This is extremely cheap (no LPs solved) and works well once sufficient history has been accumulated. The problem is *initialization*: at the start of the search, no branching history exists, so pseudocost estimates are unreliable and the first branching decisions may be poor, leading to a large tree that is difficult to recover from.
+This is extremely cheap (no LPs solved) and works well once sufficient history has been accumulated. The problem is _initialization_: at the start of the search, no branching history exists, so pseudocost estimates are unreliable and the first branching decisions may be poor, leading to a large tree that is difficult to recover from.
 
 ### 2.4 Reliability Branching
 
-Reliability branching, introduced by Achterberg, Koch, and Martin (2005), elegantly combines strong branching and pseudocost branching. The key idea: use strong branching to *initialize* pseudocosts, then switch to pseudocost estimates once they become *reliable*.
+Reliability branching, introduced by Achterberg, Koch, and Martin (2005), elegantly combines strong branching and pseudocost branching. The key idea: use strong branching to _initialize_ pseudocosts, then switch to pseudocost estimates once they become _reliable_.
 
 A variable $j$ is considered **reliable** if it has been strong-branched at least $\eta$ times in both directions (the **reliability parameter**). The algorithm:
 
@@ -113,12 +113,12 @@ Reliability branching coexists with the existing Balas branching strategy. When 
 
 The following command-line parameters control branching behavior:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
+| Parameter              | Default     | Description                                                           |
+| ---------------------- | ----------- | --------------------------------------------------------------------- |
 | `--branch reliability` | reliability | Branching strategy (`reliability`, `most_fractional`, `highest_cost`) |
-| `--reliability-eta N` | 4 | Number of observations before pseudocost is considered reliable |
-| `--reliability-sb N` | 8 | Maximum strong-branch probes per node |
-| `--balas-frequency F` | 0.6 | Frequency of aggressive Balas branching during stagnation |
+| `--reliability-eta N`  | 4           | Number of observations before pseudocost is considered reliable       |
+| `--reliability-sb N`   | 8           | Maximum strong-branch probes per node                                 |
+| `--balas-frequency F`  | 0.6         | Frequency of aggressive Balas branching during stagnation             |
 
 ## 5. Experimental Results
 
@@ -132,21 +132,21 @@ All experiments use the OR-Library SCP benchmark instances (Beasley, 1990) on Wi
 
 ### 5.2 Results
 
-| Instance | Baseline |  |  Balas+Preproc  |  | Reliability |  |
-|----------|-----:|------:|-----:|------:|-----:|------:|
-|          | Nodes | Time | Nodes | Time | Nodes | Time |
-| scpa1    |   363 |  75.0 s |   478 |  19.5 s |   113 |  16.4 s |
-| scpa2    |   199 |  41.7 s |   227 |  16.2 s |   116 |  17.1 s |
-| scpa3    |   137 |  41.3 s |    51 |  17.4 s |    81 |  18.2 s |
-| scpa4    |    47 |  21.4 s |    41 |  15.9 s |    31 |  15.0 s |
-| scpa5    |    58 |  20.1 s |    18 |  15.9 s |    12 |  16.9 s |
-| scpb1    |   182 |  55.7 s |   182 |  22.2 s |   123 |  23.4 s |
-| scpb2    |  1641 | 361.3 s |  1577 |  42.6 s |   341 |  29.2 s |
-| scpb3    |  1339 | 288.6 s |  1375 |  31.6 s |   241 |  24.7 s |
-| scpb4    |  6939 |1543.8 s |  6541 | 112.0 s |   713 |  33.9 s |
-| scpb5    |   379 |  97.5 s |   383 |  24.1 s |   161 |  23.6 s |
-| **Total A** | **804** | **199.5 s** | **815** | **84.9 s** | **353** | **83.7 s** |
-| **Total B** | **10480** | **2346.9 s** | **10058** | **232.4 s** | **1579** | **134.8 s** |
+| Instance    |  Baseline |              | Balas+Preproc |             | Reliability |             |
+| ----------- | --------: | -----------: | ------------: | ----------: | ----------: | ----------: |
+|             |     Nodes |         Time |         Nodes |        Time |       Nodes |        Time |
+| scpa1       |       363 |       75.0 s |           478 |      19.5 s |         113 |      16.4 s |
+| scpa2       |       199 |       41.7 s |           227 |      16.2 s |         116 |      17.1 s |
+| scpa3       |       137 |       41.3 s |            51 |      17.4 s |          81 |      18.2 s |
+| scpa4       |        47 |       21.4 s |            41 |      15.9 s |          31 |      15.0 s |
+| scpa5       |        58 |       20.1 s |            18 |      15.9 s |          12 |      16.9 s |
+| scpb1       |       182 |       55.7 s |           182 |      22.2 s |         123 |      23.4 s |
+| scpb2       |      1641 |      361.3 s |          1577 |      42.6 s |         341 |      29.2 s |
+| scpb3       |      1339 |      288.6 s |          1375 |      31.6 s |         241 |      24.7 s |
+| scpb4       |      6939 |     1543.8 s |          6541 |     112.0 s |         713 |      33.9 s |
+| scpb5       |       379 |       97.5 s |           383 |      24.1 s |         161 |      23.6 s |
+| **Total A** |   **804** |  **199.5 s** |       **815** |  **84.9 s** |     **353** |  **83.7 s** |
+| **Total B** | **10480** | **2346.9 s** |     **10058** | **232.4 s** |    **1579** | **134.8 s** |
 
 ### 5.3 Analysis
 
@@ -160,7 +160,7 @@ All experiments use the OR-Library SCP benchmark instances (Beasley, 1990) on Wi
 
 ## 6. References
 
-1. T. Achterberg, T. Koch, A. Martin. *Branching rules revisited.* Operations Research Letters, 33(1):42-54, 2005.
-2. T. Berthold. *Hybrid Branching.* In: Integration of AI and OR Techniques in Constraint Programming, LNCS 8451, pp. 309-324, 2014.
-3. G. Gamrath, T. Koch, A. Martin, M. Miltenberger, D. Weninger. *Improving Strong Branching by Domain Propagation.* EURO Journal on Computational Optimization, 3(1):27-60, 2015.
-4. A. Khalil, P. Le Bodic, L. Song, G. Nemhauser, B. Dilkina. *Learning to Branch in Mixed Integer Programming.* AAAI Conference on Artificial Intelligence, 2016.
+1. T. Achterberg, T. Koch, A. Martin. _Branching rules revisited._ Operations Research Letters, 33(1):42-54, 2005.
+2. T. Berthold. _Hybrid Branching._ In: Integration of AI and OR Techniques in Constraint Programming, LNCS 8451, pp. 309-324, 2014.
+3. G. Gamrath, T. Koch, A. Martin, M. Miltenberger, D. Weninger. _Improving Strong Branching by Domain Propagation._ EURO Journal on Computational Optimization, 3(1):27-60, 2015.
+4. A. Khalil, P. Le Bodic, L. Song, G. Nemhauser, B. Dilkina. _Learning to Branch in Mixed Integer Programming._ AAAI Conference on Artificial Intelligence, 2016.
