@@ -915,10 +915,6 @@ int dominance_finder(ColumnPreprocessContext &ctx, double tol,
         }
     }
 
-    if (verbosity >= 2 && removed > 0) {
-        fprintf(stderr, "  Dominance Finder: %d cols removed\n", removed);
-    }
-
     return removed;
 }
 

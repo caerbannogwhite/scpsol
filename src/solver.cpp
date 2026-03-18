@@ -666,10 +666,14 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         obj = base.obj; active_to_input = base.active_to_original;
         ncols = base.ncols;
 
-        // Reduced-cost fixing: remove columns with reduced cost > gap
+        // Iterative reduced-cost fixing: fix-resolve-fix cycles
         if (root_sol.solved && root_sol.optimal && std::isfinite(best_obj)) {
-            const double gap = best_obj - root_sol.dual_obj;
-            if (gap > tol) {
+            const int max_rc_iters = 10;
+            int total_rc_removed = 0;
+            for (int rc_iter = 0; rc_iter < max_rc_iters; ++rc_iter) {
+                const double gap = best_obj - root_sol.dual_obj;
+                if (gap <= tol) break;
+
                 auto rcosts = compute_reduced_costs(obj, root_sol.row_dual,
                     base, std::min(ncols, static_cast<int>(root_sol.col_value.size())));
                 int rc_removed = 0;
@@ -681,47 +685,211 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                         ++rc_removed;
                     }
                 }
-                if (rc_removed > 0) {
-                    // Rebuild without fixed columns
-                    std::vector<int> old_to_new(static_cast<size_t>(ncols), -1);
-                    std::vector<int> new_active_input;
-                    std::vector<double> new_obj_rc;
-                    int nc = 0;
-                    for (int j = 0; j < ncols; ++j) {
-                        if (rc_active[static_cast<size_t>(j)]) {
-                            old_to_new[static_cast<size_t>(j)] = nc;
-                            new_active_input.push_back(active_to_input[static_cast<size_t>(j)]);
-                            new_obj_rc.push_back(obj[static_cast<size_t>(j)]);
-                            ++nc;
+                if (rc_removed == 0) break;
+
+                // Rebuild without fixed columns
+                std::vector<int> old_to_new(static_cast<size_t>(ncols), -1);
+                std::vector<int> new_active_input;
+                std::vector<double> new_obj_rc;
+                int nc = 0;
+                for (int j = 0; j < ncols; ++j) {
+                    if (rc_active[static_cast<size_t>(j)]) {
+                        old_to_new[static_cast<size_t>(j)] = nc;
+                        new_active_input.push_back(active_to_input[static_cast<size_t>(j)]);
+                        new_obj_rc.push_back(obj[static_cast<size_t>(j)]);
+                        ++nc;
+                    }
+                }
+                std::vector<int> new_inds_rc;
+                std::vector<int> new_offs_rc;
+                std::vector<double> new_vals_rc;
+                new_offs_rc.push_back(0);
+                for (int i = 0; i < nrows; ++i) {
+                    for (int k = csr_offs[static_cast<size_t>(i)];
+                         k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                        const int c = csr_inds[static_cast<size_t>(k)];
+                        if (c >= 0 && c < ncols) {
+                            const int m = old_to_new[static_cast<size_t>(c)];
+                            if (m >= 0) {
+                                new_inds_rc.push_back(m);
+                                new_vals_rc.push_back(csr_vals[static_cast<size_t>(k)]);
+                            }
                         }
                     }
-                    std::vector<int> new_inds_rc;
-                    std::vector<int> new_offs_rc;
-                    std::vector<double> new_vals_rc;
-                    new_offs_rc.push_back(0);
+                    new_offs_rc.push_back(static_cast<int>(new_vals_rc.size()));
+                }
+                if (verbosity >= 3)
+                    fprintf(stderr, "  RC fixing iter %d: %d cols removed, %d remaining\n",
+                            rc_iter + 1, rc_removed, nc);
+                ncols = nc;
+                csr_inds = std::move(new_inds_rc);
+                csr_offs = std::move(new_offs_rc);
+                csr_vals = std::move(new_vals_rc);
+                obj = std::move(new_obj_rc);
+                active_to_input = std::move(new_active_input);
+                total_rc_removed += rc_removed;
+
+                // Rebuild base model and re-solve LP
+                build_base();
+                lp.rebuild_model(base);
+                root_sol = lp.solve();
+                ++total_lp_solves;
+                if (!root_sol.solved || !root_sol.optimal) break;
+                lp.save_basis();
+
+                // Run heuristics on tighter LP (may improve incumbent → smaller gap)
+                BranchNodeState rc_node;
+                for (const auto &h : heuristics) {
+                    auto hr = h->tryBuild(root_sol.col_value, root_sol.row_dual, base, rc_node, integ_tol);
+                    if (hr.feasible && hr.objective < best_obj - tol) {
+                        best_obj = hr.objective;
+                        adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
+                        incumbent_source = std::string("rcfix_") + hr.name;
+                    }
+                }
+
+                // Update working arrays from base for next iteration
+                csr_inds = base.csr_inds; csr_offs = base.csr_offs; csr_vals = base.csr_vals;
+                obj = base.obj; active_to_input = base.active_to_original;
+                ncols = base.ncols;
+            }
+            if (total_rc_removed > 0 && verbosity >= 2)
+                fprintf(stderr, "  Iterative RC fixing: %d cols removed total\n", total_rc_removed);
+        }
+
+        // LP-based probing: fix x_j=0, check if infeasible or bound > incumbent
+        if (root_sol.solved && root_sol.optimal && std::isfinite(best_obj) && ncols <= 800) {
+            const auto probe_start = Clock::now();
+            const double probe_time_limit = 10.0;
+
+            // base and LP are already current from iterative RC fixing (or initial build)
+            {
+
+                // Only probe columns with x_j > 0 in LP (fixing x_j=0 when already at 0 is a no-op)
+                // Sort by decreasing LP value (most impactful to force to 0)
+                std::vector<int> probe_order;
+                for (int j = 0; j < ncols; ++j) {
+                    if (root_sol.col_value[static_cast<size_t>(j)] > tol)
+                        probe_order.push_back(j);
+                }
+                std::sort(probe_order.begin(), probe_order.end(),
+                          [&](int a, int b) { return root_sol.col_value[static_cast<size_t>(a)] > root_sol.col_value[static_cast<size_t>(b)]; });
+
+                std::vector<char> probe_fix_one(static_cast<size_t>(ncols), 0);
+                int probe_fixed = 0;
+                HighsBasis probe_basis = lp.get_basis();
+
+                for (int j : probe_order) {
+                    const double elapsed = std::chrono::duration<double>(Clock::now() - probe_start).count();
+                    if (elapsed > probe_time_limit) break;
+
+                    lp.restore_base_state();
+                    lp.set_basis(probe_basis);
+                    BranchDecision fix_zero{j, 0};
+                    lp.apply_decisions({fix_zero});
+                    auto probe_sol = lp.solve();
+                    ++total_lp_solves;
+
+                    if (!probe_sol.solved || probe_sol.infeasible ||
+                        (probe_sol.optimal && probe_sol.primal_obj > best_obj - tol)) {
+                        probe_fix_one[static_cast<size_t>(j)] = 1;
+                        ++probe_fixed;
+                    }
+                }
+
+                // Restore LP state
+                lp.restore_base_state();
+                lp.set_basis(probe_basis);
+
+                if (probe_fixed > 0) {
+                    if (verbosity >= 2)
+                        fprintf(stderr, "  LP probing: %d cols fixed to 1\n", probe_fixed);
+
+                    double probe_fixed_cost = 0.0;
+                    double probe_incumbent_cost = 0.0;
+                    std::vector<char> row_covered(static_cast<size_t>(nrows), 0);
+
+                    for (int j = 0; j < ncols; ++j) {
+                        if (!probe_fix_one[static_cast<size_t>(j)]) continue;
+                        probe_fixed_cost += obj[static_cast<size_t>(j)];
+                        const int orig = active_to_input[static_cast<size_t>(j)];
+                        fixed_original_cols.push_back(orig);
+                        if (!best_solution.empty() && orig >= 0 && orig < ncols_input &&
+                            best_solution[static_cast<size_t>(orig)] > 0.5)
+                            probe_incumbent_cost += obj[static_cast<size_t>(j)];
+                        for (const auto &entry : base.cols_to_rows[static_cast<size_t>(j)]) {
+                            if (entry.row >= 0 && entry.row < nrows && entry.val > 0.0)
+                                row_covered[static_cast<size_t>(entry.row)] = 1;
+                        }
+                    }
+
+                    // Rebuild without probed columns and their covered rows
+                    std::vector<int> old_col_to_new(static_cast<size_t>(ncols), -1);
+                    int new_ncols = 0;
+                    std::vector<int> new_active;
+                    std::vector<double> new_obj;
+                    for (int j = 0; j < ncols; ++j) {
+                        if (!probe_fix_one[static_cast<size_t>(j)]) {
+                            old_col_to_new[static_cast<size_t>(j)] = new_ncols++;
+                            new_active.push_back(active_to_input[static_cast<size_t>(j)]);
+                            new_obj.push_back(obj[static_cast<size_t>(j)]);
+                        }
+                    }
+                    int new_nrows = 0;
+                    std::vector<int> new_csr_offs, new_csr_inds;
+                    std::vector<double> new_csr_vals;
+                    new_csr_offs.push_back(0);
                     for (int i = 0; i < nrows; ++i) {
-                        for (int k = csr_offs[static_cast<size_t>(i)];
-                             k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+                        if (row_covered[static_cast<size_t>(i)]) continue;
+                        for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
                             const int c = csr_inds[static_cast<size_t>(k)];
                             if (c >= 0 && c < ncols) {
-                                const int m = old_to_new[static_cast<size_t>(c)];
+                                const int m = old_col_to_new[static_cast<size_t>(c)];
                                 if (m >= 0) {
-                                    new_inds_rc.push_back(m);
-                                    new_vals_rc.push_back(csr_vals[static_cast<size_t>(k)]);
+                                    new_csr_inds.push_back(m);
+                                    new_csr_vals.push_back(csr_vals[static_cast<size_t>(k)]);
                                 }
                             }
                         }
-                        new_offs_rc.push_back(static_cast<int>(new_vals_rc.size()));
+                        new_csr_offs.push_back(static_cast<int>(new_csr_vals.size()));
+                        ++new_nrows;
                     }
-                    if (verbosity >= 3)
-                        fprintf(stderr, "  Reduced-cost fixing: %d cols removed, %d remaining\n",
-                                rc_removed, nc);
-                    ncols = nc;
-                    csr_inds = std::move(new_inds_rc);
-                    csr_offs = std::move(new_offs_rc);
-                    csr_vals = std::move(new_vals_rc);
-                    obj = std::move(new_obj_rc);
-                    active_to_input = std::move(new_active_input);
+
+                    ncols = new_ncols;
+                    nrows = new_nrows;
+                    csr_inds = std::move(new_csr_inds);
+                    csr_offs = std::move(new_csr_offs);
+                    csr_vals = std::move(new_csr_vals);
+                    obj = std::move(new_obj);
+                    active_to_input = std::move(new_active);
+
+                    fixed_preprocess_cost += probe_fixed_cost;
+                    best_obj -= probe_incumbent_cost;
+                    if (std::isfinite(global_dual_bound))
+                        global_dual_bound -= probe_fixed_cost;
+                    if (std::isfinite(global_dual_bound_raw))
+                        global_dual_bound_raw -= probe_fixed_cost;
+
+                    // Rebuild and re-solve for heuristics on reduced model
+                    build_base();
+                    lp.rebuild_model(base);
+                    root_sol = lp.solve();
+                    ++total_lp_solves;
+                    if (root_sol.solved && root_sol.optimal) {
+                        lp.save_basis();
+                        BranchNodeState probe_node;
+                        for (const auto &h : heuristics) {
+                            auto hr = h->tryBuild(root_sol.col_value, root_sol.row_dual, base, probe_node, integ_tol);
+                            if (hr.feasible && hr.objective < best_obj - tol) {
+                                best_obj = hr.objective;
+                                adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
+                                incumbent_source = std::string("probe_") + hr.name;
+                            }
+                        }
+                        csr_inds = base.csr_inds; csr_offs = base.csr_offs; csr_vals = base.csr_vals;
+                        obj = base.obj; active_to_input = base.active_to_original;
+                        ncols = base.ncols;
+                    }
                 }
             }
         }
@@ -790,9 +958,13 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         if (root_sol.solved && root_sol.optimal) lp.save_basis();
     }
 
-    if (verbosity >= 2)
-        fprintf(stderr, "BnB base model: %d rows x %d cols, nnz=%d\n",
-                base.nrows, base.ncols, base.nnz);
+    if (verbosity >= 2) {
+        const double density = (base.nrows > 0 && base.ncols > 0)
+            ? 100.0 * base.nnz / (static_cast<double>(base.nrows) * base.ncols)
+            : 0.0;
+        fprintf(stderr, "BnB base model: %d rows x %d cols, nnz=%d (%.1f%% dense)\n",
+                base.nrows, base.ncols, base.nnz, density);
+    }
 
     // ================================================================
     // Phase 6.5: Root cut separation rounds
