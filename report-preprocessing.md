@@ -8,13 +8,11 @@ The scpsol solver implements a multi-stage preprocessing pipeline that iterates 
 
 ## 2. Problem Formulation
 
-The Set Covering Problem is:
+The Set Covering Problem (SCP) is:
 
-$$\min \sum_{j=1}^{n} c_j x_j$$
-$$\text{subject to } \sum_{j \in S_i} x_j \geq 1, \quad i = 1, \ldots, m$$
-$$x_j \in \{0, 1\}, \quad j = 1, \ldots, n$$
+$$\min \; c^T x \quad \text{s.t.} \; Ax \geq \mathbf{1}, \; x \in \{0,1\}^n$$
 
-where $c_j > 0$ is the cost of column $j$, $S_i$ is the set of columns that cover row $i$, and the constraint requires every row to be covered by at least one selected column. We denote the set of rows covered by column $j$ as $R_j$.
+where $A \in \{0,1\}^{m \times n}$ is the constraint matrix, $c > 0$ is the cost vector, and $\mathbf{1}$ is the all-ones vector. Each row $i$ must be covered by at least one selected column. We denote the set of columns covering row $i$ as $S_i = \{j : A_{ij} = 1\}$ and the set of rows covered by column $j$ as $R_j = \{i : A_{ij} = 1\}$.
 
 ## 3. Preprocessing Techniques
 
@@ -24,19 +22,7 @@ where $c_j > 0$ is the cost of column $j$, $S_i$ is the set of columns that cove
 
 Crucially, removing rows can make other columns essential. If column $k$ was one of two columns covering row $i'$, and the other column was just fixed, then $k$ becomes essential for $i'$. This creates a _cascade_ of fixings.
 
-**Implementation.** The essential column cascade in `row_reduce()` (`src/preprocessor.cpp`) iterates until quiescence:
-
-```
-repeat:
-    for each active row i:
-        count active columns covering i
-        if count == 1:
-            fix that column to 1, remove all its rows
-            mark changed = true
-until not changed
-```
-
-The fixed columns' costs are accumulated in `fixed_preprocess_cost` and subtracted from the incumbent bound, since they are known to be in every optimal solution.
+**Implementation.** The essential column cascade in `row_reduce()` (`src/preprocessor.cpp`) iterates until quiescence. Each round scans all active rows, counts active covering columns, and fixes any column that is the sole cover for some row. Fixing a column removes all its rows, which may create new singleton-covered rows in the next round. The loop terminates when a full pass produces no new fixings. The fixed columns' costs are accumulated in `fixed_preprocess_cost` and subtracted from the incumbent bound, since they are known to be in every optimal solution.
 
 ### 3.2 Row Domination
 
@@ -73,7 +59,7 @@ After all probing, a final essential column cascade picks up any newly created e
 
 **Implementation.** The `TwoColumnDominanceRule` iterates over all target columns and all pairs of candidates. Time limit checks prevent excessive computation on large instances.
 
-**Bitset acceleration.** The union-covers check $R_j \subseteq R_{k_1} \cup R_{k_2}$ is performed using `DynBitset::is_subset_of_union()`, which computes $(R_j \mathbin{\&} (R_{k_1} \mathbin{|} R_{k_2})) = R_j$ with $\lceil m/64 \rceil$ OR+AND+CMP operations per pair.
+**Bitset acceleration.** The union-covers check $R_j \subseteq R_{k_1} \cup R_{k_2}$ is performed using `DynBitset::is_subset_of_union()`, which verifies the condition using $\lceil m/64 \rceil$ bitwise OR, AND, and compare operations per pair.
 
 ### 3.6 Cost-Driven Replacement
 
@@ -85,28 +71,28 @@ After all probing, a final essential column cascade picks up any newly created e
 
 ### 3.7 Greedy Multi-Column Dominance Finder
 
-**Theory.** The pairwise (§3.4–3.6) dominance checks are exact but have $O(n^2)$ or $O(n^3)$ complexity, which becomes prohibitive for large column sets. The greedy multi-column dominance finder generalizes these checks to arbitrary numbers of replacement columns using a fast heuristic: for each candidate column $\hat{j}$, it tests whether a set of cheaper "kept" columns $\tilde{N}$ can collectively cover all rows of $\hat{j}$ at total cost $\leq c_{\hat{j}}$.
+**Theory.** The pairwise (§3.4–3.6) dominance checks are exact but have $O(n^2)$ or $O(n^3)$ complexity, which becomes prohibitive for large column sets. The greedy multi-column dominance finder generalizes these checks to arbitrary numbers of replacement columns using a fast heuristic: for each candidate column $j$, it tests whether a set of cheaper "kept" columns $K$ can collectively cover all rows of $j$ at total cost $\leq c_j$.
 
-The algorithm follows the structure of Algorithm 1 from Grossman & Wool (1997):
+The algorithm follows the structure of Algorithm 1 from Grossman and Wool (1997):
 
-1. Initialize $\tilde{N}$ with all unit-cost columns ($c_j = 1$).
-2. Sort remaining columns $\hat{N}$ by ascending cost.
-3. For each $\hat{j} \in \hat{N}$ (cheapest first):
-   - Test: can columns in $\tilde{N}$ cover all rows $R_{\hat{j}}$ at cost $\leq c_{\hat{j}}$?
-   - If yes: remove $\hat{j}$ (it is dominated).
-   - If no: add $\hat{j}$ to $\tilde{N}$ (it is needed for future tests).
+1. Initialize $K$ with all unit-cost columns ($c_j = 1$).
+2. Sort remaining columns $N$ by ascending cost.
+3. For each $j \in N$ (cheapest first):
+   - Test: can columns in $K$ cover all rows $R_j$ at cost $\leq c_j$?
+   - If yes: remove $j$ (it is dominated).
+   - If no: add $j$ to $K$ (it is needed for future tests).
 
-**Implementation.** The `dominance_finder()` function in `src/preprocessor.cpp` uses a greedy set cover heuristic for each dominance test, rather than solving a sub-MIP. For each candidate $\hat{j}$:
+**Implementation.** The `dominance_finder()` function in `src/preprocessor.cpp` uses a greedy set cover heuristic for each dominance test, rather than solving a sub-MIP. For each candidate $j$:
 
-1. **Feasibility check**: Verify every row of $\hat{j}$ has $\geq 1$ covering column in $\tilde{N}$. If not, $\hat{j}$ cannot be dominated — keep it.
-2. **Greedy cover**: Collect all $\tilde{N}$-columns sharing rows with $\hat{j}$. Repeatedly select the column with the best (uncovered rows of $\hat{j}$) / cost ratio until all rows are covered or the budget is exhausted.
-3. If all rows are covered within budget $c_{\hat{j}}$, remove $\hat{j}$.
+1. **Feasibility check**: Verify every row of $j$ has at least one covering column in $K$. If not, $j$ cannot be dominated — keep it.
+2. **Greedy cover**: Collect all $K$-columns sharing rows with $j$. Repeatedly select the column with the best (uncovered rows of $j$) / cost ratio until all rows are covered or the budget is exhausted.
+3. If all rows are covered within budget $c_j$, remove $j$.
 
 **Key implementation details:**
 
-- Maintains a reverse index `tilde_cols_by_row` (updated incrementally as $\tilde{N}$ grows).
+- Maintains a reverse index `tilde_cols_by_row` (updated incrementally as $K$ grows).
 - Uses reusable `uncovered` and `is_candidate` buffers to avoid per-column allocation.
-- Worst-case $O(|\hat{N}| \cdot |\tilde{N}| \cdot \text{avg\_rows})$ but very fast in practice ($< 0.1$s on 3000-column instances).
+- Worst-case $O(|N| \cdot |K| \cdot \bar{r})$ where $\bar{r}$ is the average rows per column, but very fast in practice (under 0.1s on 3000-column instances).
 
 **Impact.** On OR-Library benchmark instances, the greedy DF removes 50–85% of surviving columns (after cost/budget pruning) with negligible overhead. By running before the $O(n^2)$ pairwise checks, it reduces their input from $\sim$2600 to $\sim$400 columns, yielding a $\sim$5× speedup in total preprocessing time.
 
@@ -154,15 +140,13 @@ The incremental update (step 4) ensures that coverage counts are maintained in $
 
 **Post-processing: Redundancy Removal.** After the greedy completes, a redundancy removal pass tries to remove unnecessary columns. Selected columns are sorted by cost (most expensive first), and each column is tentatively removed: if all rows remain covered (each row's coverage count stays $\geq 1$), the column is permanently dropped. This reduces the initial incumbent $z^*$, which in turn enables more aggressive cost reduction and budget pruning in subsequent preprocessing stages.
 
-## 4b. BnB Heuristic: Dual-Guided Cover Repair
+### 4.3 BnB Heuristic: Dual-Guided Cover Repair
 
-### Theory
+**Theory.**
 
 The `DualGuidedCoverRepairHeuristic` (`src/heuristics.cpp`) constructs integer-feasible solutions during branch-and-bound by combining LP relaxation information with greedy repair. Starting from the LP solution, it fixes near-integer variables and then greedily covers remaining rows using a score that combines uncovered-row gain and dual value gain, weighted by column cost.
 
-### Implementation
-
-The heuristic uses a **column-to-rows transpose** (built once per invocation) and **incremental coverage tracking** for both the repair phase and the post-processing redundancy removal. When a column is added to the solution, only its covered rows' coverage values are updated; when a column is tentatively removed in post-processing, only its entries are subtracted. This reduces per-invocation cost from $O(n \times m \times w)$ (where $w$ is average row width) to $O(\text{nnz})$.
+**Implementation.** The heuristic uses a **column-to-rows transpose** (built once per invocation) and **incremental coverage tracking** for both the repair phase and the post-processing redundancy removal. When a column is added to the solution, only its covered rows' coverage values are updated; when a column is tentatively removed in post-processing, only its entries are subtracted. This reduces per-invocation cost from $O(n \times m \times w)$ (where $w$ is average row width) to $O(\text{nnz})$.
 
 ## 5. Preprocessing Pipeline
 
@@ -191,7 +175,7 @@ Repeat until fixpoint:
 
 1. Cost reduction (remove columns with $c_j \geq z^*$)
 2. Incumbent budget pruning
-3. **Greedy multi-column dominance finder** (see §3.10)
+3. **Greedy multi-column dominance finder** (see §3.7)
 4. Cost-driven replacement (2- and 3-column dominance)
 5. Configured dominance rules (single, two-column)
 6. Row reduction (essential columns, row domination, probing)
@@ -267,7 +251,8 @@ Available rule tokens: `single` (single column dominance), `two` (two-column dom
 
 ## 9. References
 
-- V. Chvátal. A greedy heuristic for the set-covering problem. _Mathematics of Operations Research_, 4(3):233–235, 1979.
-- E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. _Mathematical Programming Study_, 12:37–60, 1980.
-- T. Achterberg, T. Koch, and A. Martin. Constraint integer programming: a new approach to integrate CP and MIP. _LNCS_, 3011:6–20, 2004.
-- M. Savelsbergh. Preprocessing and probing techniques for mixed integer programming problems. _ORSA Journal on Computing_, 6(4):445–454, 1994.
+1. V. Chvátal. A greedy heuristic for the set-covering problem. _Mathematics of Operations Research_, 4(3):233–235, 1979.
+2. E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. _Mathematical Programming Study_, 12:37–60, 1980.
+3. T. Grossman and A. Wool. Computational experience with approximation algorithms for the set covering problem. _European Journal of Operational Research_, 101(1):81–92, 1997.
+4. T. Achterberg, T. Koch, and A. Martin. Constraint integer programming: a new approach to integrate CP and MIP. _LNCS_, 3011:6–20, 2004.
+5. M. Savelsbergh. Preprocessing and probing techniques for mixed integer programming problems. _ORSA Journal on Computing_, 6(4):445–454, 1994.

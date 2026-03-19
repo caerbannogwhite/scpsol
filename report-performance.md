@@ -119,7 +119,7 @@ Best-bound search improved dual bound progression, enabling earlier pruning. Bas
 
 ### 9.1 Techniques Added
 
-1. **Greedy multi-column dominance finder** — for each non-unit-cost column, greedy check if cheaper columns cover same rows (see report-preprocessing.md, Section 3.7)
+1. **Greedy multi-column dominance finder** — for each non-unit-cost column, greedy check if cheaper columns cover same rows (see `report-preprocessing.md`, §3.7)
 2. **Pipeline reordering** — run O(n) DF before O(n^2/n^3) pairwise dominance
 3. **Greedy redundancy removal** — post-process greedy heuristic to remove unnecessary columns
 4. **Cached column-to-rows transpose** — built once in BaseRelaxationModel, reused by heuristics
@@ -259,8 +259,8 @@ Input (.scp file)
 
 ## 13. References
 
-- E. Beasley. OR-Library: distributing test problems by electronic mail. _Journal of the Operational Research Society_, 41(11):1069-1072, 1990.
-- T. Grossman and A. Wool. Computational experience with approximation algorithms for the set covering problem. _European Journal of Operational Research_, 101(1):81-92, 1997.
-- V. Chvatal. A greedy heuristic for the set-covering problem. _Mathematics of Operations Research_, 4(3):233-235, 1979.
-- T. Achterberg, T. Koch, A. Martin. Branching rules revisited. _Operations Research Letters_, 33(1):42-54, 2005.
-- E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. _Mathematical Programming Study_, 12:37-60, 1980.
+1. E. Beasley. OR-Library: distributing test problems by electronic mail. _Journal of the Operational Research Society_, 41(11):1069–1072, 1990.
+2. T. Grossman and A. Wool. Computational experience with approximation algorithms for the set covering problem. _European Journal of Operational Research_, 101(1):81–92, 1997.
+3. V. Chvátal. A greedy heuristic for the set-covering problem. _Mathematics of Operations Research_, 4(3):233–235, 1979.
+4. T. Achterberg, T. Koch, and A. Martin. Branching rules revisited. _Operations Research Letters_, 33(1):42–54, 2005.
+5. E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. _Mathematical Programming Study_, 12:37–60, 1980.

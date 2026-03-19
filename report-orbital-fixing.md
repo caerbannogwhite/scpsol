@@ -10,7 +10,7 @@ Orbital fixing is a symmetry-breaking technique that detects interchangeable var
 
 ### 2.1 Symmetry in Set Covering Problems
 
-A Set Covering Problem has the form:
+The Set Covering Problem (SCP) is:
 
 $$\min \; c^T x \quad \text{s.t.} \; Ax \geq \mathbf{1}, \; x \in \{0,1\}^n$$
 
@@ -102,21 +102,12 @@ For each equivalence class of size $k$, one column is kept free (the representat
 
 ### 4.1 Data Structures
 
-The implementation uses a single state object that persists across BnB nodes:
+The implementation uses a single `OrbitalFixingState` object that persists across BnB nodes, containing:
 
-```
-struct OrbitalFixingState {
-    cost_groups    : vector<vector<int>>   — column groups with identical cost
-    row_hash       : vector<uint64_t>      — Zobrist hash table (row → random value)
-    total_fixed    : int                   — cumulative fixings across all nodes
-    calls          : int                   — number of nodes where orbital fixing was attempted
-    disabled       : bool                  — auto-disable flag
-    col_state_buf  : vector<int8_t>        — scratch: column decision state (-1/0/+1)
-    row_decided_buf: vector<uint8_t>       — scratch: whether each row is decided
-};
-```
-
-The scratch buffers are reused across calls to avoid per-node allocation overhead.
+- **Cost groups** — column groups with identical cost (only groups of size > 1)
+- **Zobrist hash table** — a random 64-bit value per row, generated once from a deterministic seed
+- **Counters** — cumulative fixings and call count for auto-disable logic
+- **Scratch buffers** — per-column decision state and per-row decided flags, reused across calls to avoid per-node allocation overhead
 
 ### 4.2 Integration with BnB
 

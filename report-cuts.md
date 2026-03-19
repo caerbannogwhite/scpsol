@@ -8,6 +8,8 @@ The scpsol solver implements three families of cutting planes: Chvátal-Gomory (
 
 ## 2. Background
 
+The Set Covering Problem (SCP) is $\min \; c^T x$ subject to $Ax \geq \mathbf{1}$, $x \in \{0,1\}^n$, where $A \in \{0,1\}^{m \times n}$ is the constraint matrix and $c > 0$ is the cost vector.
+
 ### 2.1 The LP Relaxation Gap
 
 The SCP LP relaxation replaces $x_j \in \{0,1\}$ with $0 \leq x_j \leq 1$. The optimal LP value $z_{LP}$ provides a lower bound on the integer optimum $z^*$. The _integrality gap_ $z^* - z_{LP}$ determines the search effort: a tighter LP bound means fewer branch-and-bound nodes.
@@ -211,7 +213,7 @@ When columns are eliminated during mid-BnB preprocessing, all cuts are remapped 
 
 ## 8. References
 
-- E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. _Mathematical Programming Study_, 12:37–60, 1980.
-- V. Chvátal. Edmonds polytopes and a hierarchy of combinatorial problems. _Discrete Mathematics_, 4(4):305–337, 1973.
-- R. E. Gomory. Outline of an algorithm for integer solutions to linear programs. _Bulletin of the American Mathematical Society_, 64(5):275–278, 1958.
-- G. L. Nemhauser and L. A. Wolsey. _Integer and Combinatorial Optimization_. Wiley, 1988. Chapter II.2 (Chvátal-Gomory cuts) and Chapter II.3 (cover inequalities).
+1. E. Balas and A. Ho. Set covering algorithms using cutting planes, heuristics, and subgradient optimization. _Mathematical Programming Study_, 12:37–60, 1980.
+2. V. Chvátal. Edmonds polytopes and a hierarchy of combinatorial problems. _Discrete Mathematics_, 4(4):305–337, 1973.
+3. R. E. Gomory. Outline of an algorithm for integer solutions to linear programs. _Bulletin of the American Mathematical Society_, 64(5):275–278, 1958.
+4. G. L. Nemhauser and L. A. Wolsey. _Integer and Combinatorial Optimization_. Wiley, 1988. Chapter II.2 (Chvátal-Gomory cuts) and Chapter II.3 (cover inequalities).

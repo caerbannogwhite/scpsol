@@ -10,17 +10,17 @@ The scpsol solver implements Lagrangian relaxation following the approach of Bal
 
 ### 2.1 Lagrangian Relaxation for SCP
 
-The Set Covering Problem has the form:
+The Set Covering Problem (SCP) is:
 
-$$\min \; c^T x \quad \text{s.t.} \; Ax \geq b, \; x \in \{0,1\}^n$$
+$$\min \; c^T x \quad \text{s.t.} \; Ax \geq \mathbf{1}, \; x \in \{0,1\}^n$$
 
-where $A$ is a 0-1 matrix, $b = \mathbf{1}$ (each row must be covered at least once), and $c > 0$ are column costs.
+where $A \in \{0,1\}^{m \times n}$ is the constraint matrix, $c > 0$ is the cost vector, and $\mathbf{1}$ is the all-ones vector.
 
 The Lagrangian relaxation with respect to the covering constraints introduces non-negative multipliers $u \geq 0$:
 
-$$L(u) = \min_{0 \leq x \leq 1} \; (c - A^T u)^T x + u^T b$$
+$$L(u) = \min_{0 \leq x \leq 1} \; (c - A^T u)^T x + \mathbf{1}^T u$$
 
-The covering constraints are moved into the objective as penalties. Violating row $i$ (having $\sum_j A_{ij} x_j < b_i$) incurs a cost proportional to the multiplier $u_i$.
+The covering constraints are moved into the objective as penalties. Violating row $i$ (having $\sum_j A_{ij} x_j < 1$) incurs a cost proportional to the multiplier $u_i$.
 
 ### 2.2 Subproblem Decomposition
 
@@ -34,7 +34,7 @@ $$x_j^* = \begin{cases} 1 & \text{if } \bar{c}_j < 0 \\ 0 & \text{otherwise} \en
 
 The Lagrangian bound is then:
 
-$$L(u) = \sum_i u_i b_i + \sum_{j : \bar{c}_j < 0} \bar{c}_j$$
+$$L(u) = \sum_i u_i + \sum_{j : \bar{c}_j < 0} \bar{c}_j$$
 
 This is a valid lower bound on the integer optimum for any $u \geq 0$. The Lagrangian dual seeks the tightest such bound: $\max_{u \geq 0} L(u)$.
 
@@ -42,7 +42,7 @@ This is a valid lower bound on the integer optimum for any $u \geq 0$. The Lagra
 
 For SCP, the LP relaxation and the Lagrangian dual provide the _same bound_ at optimality. This follows from LP strong duality: the constraint matrix is non-negative with $\geq$ constraints, so the LP dual is:
 
-$$\max \; b^T u \quad \text{s.t.} \; A^T u \leq c, \; u \geq 0$$
+$$\max \; \mathbf{1}^T u \quad \text{s.t.} \; A^T u \leq c, \; u \geq 0$$
 
 which is exactly the Lagrangian dual $\max_{u \geq 0} L(u)$. At the LP optimum, $L(u^*) = z_{LP}$.
 
@@ -52,7 +52,7 @@ Since the LP relaxation is solved exactly at the root node, the Lagrangian bound
 
 To maximize $L(u)$ over $u \geq 0$, we use the subgradient method (Held and Karp, 1971; Held, Wolfe, and Crowder, 1974). At iteration $k$, the subgradient of $L$ at $u^k$ is:
 
-$$s_i^k = b_i - \sum_j A_{ij} x_j^*(u^k)$$
+$$s_i^k = 1 - \sum_j A_{ij} x_j^*(u^k)$$
 
 This measures the _coverage deficit_ of row $i$ under the Lagrangian solution: positive if the row is uncovered, negative if over-covered.
 
@@ -78,7 +78,7 @@ Start with the columns selected by the Lagrangian subproblem ($x_j = 1$ when $\b
 
 ### 3.2 Greedy Repair
 
-Identify uncovered rows (where $\sum_j A_{ij} x_j < b_i$) and greedily add columns to cover them. At each step, select the unselected column $j$ maximizing:
+Identify uncovered rows (where $\sum_j A_{ij} x_j < 1$) and greedily add columns to cover them. At each step, select the unselected column $j$ maximizing:
 
 $$\text{score}(j) = \frac{\text{uncovered rows newly covered by } j}{c_j}$$
 
@@ -90,14 +90,14 @@ Repeat until all rows are covered. The Lagrangian seed typically covers most row
 
 After repair, the solution may contain redundant columns — columns whose removal would leave all rows still covered. Sort selected columns by decreasing cost and attempt to remove each one:
 
-- For column $k$, check if every row $i$ covered by $k$ has sufficient remaining coverage: $\text{coverage}_i - A_{ik} \geq b_i$
+- For column $k$, check if every row $i$ covered by $k$ has sufficient remaining coverage: $\text{coverage}_i - A_{ik} \geq 1$
 - If so, remove $k$ and update the coverage counts
 
 This phase drops expensive columns that were included by the Lagrangian seed but are made redundant by the repair phase or by other seed columns.
 
 ### 3.4 Feasibility Verification
 
-As a safety check, the heuristic solution is verified against the original CSR constraint matrix before being accepted. Each row is checked independently to ensure $\sum_j A_{ij} x_j \geq b_i$, guarding against numerical errors in the incremental coverage tracking.
+As a safety check, the heuristic solution is verified against the original CSR constraint matrix before being accepted. Each row is checked independently to ensure $\sum_j A_{ij} x_j \geq 1$, guarding against numerical errors in the incremental coverage tracking.
 
 ## 4. Implementation
 

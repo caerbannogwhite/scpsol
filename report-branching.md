@@ -8,11 +8,13 @@ This report describes the branching strategies implemented in scpsol, the theory
 
 ## 2. Background: Branching Variable Selection
 
+The Set Covering Problem (SCP) is $\min \; c^T x$ subject to $Ax \geq \mathbf{1}$, $x \in \{0,1\}^n$, where $A \in \{0,1\}^{m \times n}$ is the constraint matrix and $c > 0$ is the cost vector.
+
 Given an LP relaxation solution where variable $x_j$ has fractional value $f_j \in (0, 1)$, branching creates two child nodes: one with $x_j = 0$ and one with $x_j = 1$. The key question is: _which_ fractional variable should we branch on?
 
 ### 2.1 Simple Heuristics
 
-**Most Fractional** selects the variable closest to 0.5, i.e., the one maximizing $|f_j - 0.5|$. The intuition is that variables near 0 or 1 are "almost decided" and branching on them yields little new information. This is fast (O(n) scan) but ignores the objective function entirely.
+**Most Fractional** selects the variable closest to 0.5, i.e., the one minimizing $|f_j - 0.5|$. The intuition is that variables near 0 or 1 are "almost decided" and branching on them yields little new information. This is fast ($O(n)$ scan) but ignores the objective function entirely.
 
 **Highest Cost Fractional** selects the fractional variable with the largest objective coefficient. The intuition is that fixing expensive variables early has the largest impact on the objective. This is also fast but ignores the LP structure.
 
@@ -160,7 +162,7 @@ All experiments use the OR-Library SCP benchmark instances (Beasley, 1990) on Wi
 
 ## 6. References
 
-1. T. Achterberg, T. Koch, A. Martin. _Branching rules revisited._ Operations Research Letters, 33(1):42-54, 2005.
-2. T. Berthold. _Hybrid Branching._ In: Integration of AI and OR Techniques in Constraint Programming, LNCS 8451, pp. 309-324, 2014.
-3. G. Gamrath, T. Koch, A. Martin, M. Miltenberger, D. Weninger. _Improving Strong Branching by Domain Propagation._ EURO Journal on Computational Optimization, 3(1):27-60, 2015.
-4. A. Khalil, P. Le Bodic, L. Song, G. Nemhauser, B. Dilkina. _Learning to Branch in Mixed Integer Programming._ AAAI Conference on Artificial Intelligence, 2016.
+1. T. Achterberg, T. Koch, and A. Martin. Branching rules revisited. _Operations Research Letters_, 33(1):42–54, 2005.
+2. T. Berthold. Hybrid branching. In: _Integration of AI and OR Techniques in Constraint Programming_, LNCS 8451, pp. 309–324, 2014.
+3. G. Gamrath, T. Koch, A. Martin, M. Miltenberger, and D. Weninger. Improving strong branching by domain propagation. _EURO Journal on Computational Optimization_, 3(1):27–60, 2015.
+4. A. Khalil, P. Le Bodic, L. Song, G. Nemhauser, and B. Dilkina. Learning to branch in mixed integer programming. _AAAI Conference on Artificial Intelligence_, 2016.
