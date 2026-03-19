@@ -14,12 +14,159 @@
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <random>
 #include <unordered_map>
 #include <memory>
 #include <queue>
 #include <string>
 
 namespace scpsol {
+
+// ---- Symmetry breaking: orbital fixing ----
+// Columns with the same cost that cover the same set of *undecided* rows
+// at a BnB node are interchangeable. We keep one representative per
+// equivalence class and fix the rest to 0.
+
+struct OrbitalFixingState {
+    // Column groups with identical cost (only groups of size > 1)
+    std::vector<std::vector<int>> cost_groups;
+    // Zobrist hash table: row index -> random 64-bit value
+    std::vector<uint64_t> row_hash;
+    int total_fixed = 0;
+    int calls = 0;
+    bool disabled = false; // auto-disable after fruitless attempts
+    // Scratch buffers (reused to avoid per-call allocation)
+    std::vector<int8_t> col_state_buf;
+    std::vector<uint8_t> row_decided_buf;
+};
+
+static OrbitalFixingState build_orbital_state(
+    const BaseRelaxationModel &base) {
+    OrbitalFixingState state;
+
+    // Build Zobrist hash table
+    std::mt19937_64 rng(0xBEEF5EED);
+    state.row_hash.resize(static_cast<size_t>(base.nrows));
+    for (int i = 0; i < base.nrows; ++i)
+        state.row_hash[static_cast<size_t>(i)] = rng();
+
+    // Group columns by cost (quantized to avoid floating-point issues)
+    std::unordered_map<int64_t, std::vector<int>> cost_map;
+    for (int j = 0; j < base.ncols; ++j) {
+        int64_t key = static_cast<int64_t>(std::round(base.obj[static_cast<size_t>(j)] * 1e6));
+        cost_map[key].push_back(j);
+    }
+    for (auto &[key, cols] : cost_map) {
+        if (cols.size() > 1)
+            state.cost_groups.push_back(std::move(cols));
+    }
+    return state;
+}
+
+// Compute orbital fixings at a BnB node.
+// Returns additional decisions (fix_value=0) for equivalent columns.
+static std::vector<BranchDecision> compute_orbital_fixings(
+    const ScpAdjacency &adj,
+    const std::vector<BranchDecision> &decisions,
+    OrbitalFixingState &state) {
+
+    std::vector<BranchDecision> fixings;
+    if (state.cost_groups.empty() || state.disabled) return fixings;
+
+    const int ncols = adj.ncols;
+    const int nrows = adj.nrows;
+
+    // Reuse scratch buffers
+    state.col_state_buf.assign(static_cast<size_t>(ncols), 0);
+    state.row_decided_buf.assign(static_cast<size_t>(nrows), 0);
+    auto &col_state = state.col_state_buf;
+    auto &row_decided = state.row_decided_buf;
+
+    for (const auto &d : decisions) {
+        if (d.var_index < 0 || d.var_index >= ncols) continue;
+        col_state[static_cast<size_t>(d.var_index)] =
+            static_cast<int8_t>(d.fix_value == 1 ? 1 : -1);
+        if (d.fix_value == 1) {
+            for (int r : adj.rows_by_col[static_cast<size_t>(d.var_index)])
+                if (r >= 0 && r < nrows)
+                    row_decided[static_cast<size_t>(r)] = 1;
+        }
+    }
+
+    // For each cost group, find equivalence classes of free columns
+    // based on their residual coverage (undecided rows).
+    for (const auto &group : state.cost_groups) {
+        // Hash free columns by their residual coverage
+        struct HashEntry { uint64_t hash; int col; };
+        std::vector<HashEntry> entries;
+        entries.reserve(group.size());
+        for (int j : group) {
+            if (col_state[static_cast<size_t>(j)] != 0) continue;
+            uint64_t h = 0;
+            int cnt = 0;
+            for (int r : adj.rows_by_col[static_cast<size_t>(j)]) {
+                if (r >= 0 && r < nrows && !row_decided[static_cast<size_t>(r)]) {
+                    h ^= state.row_hash[static_cast<size_t>(r)];
+                    ++cnt;
+                }
+            }
+            // Mix count into hash to reduce collisions
+            h ^= static_cast<uint64_t>(cnt) * 0x9E3779B97F4A7C15ULL;
+            entries.push_back({h, j});
+        }
+        if (entries.size() <= 1) continue;
+
+        // Sort by hash to cluster potential equivalences
+        std::sort(entries.begin(), entries.end(),
+                  [](const HashEntry &a, const HashEntry &b) {
+                      return a.hash < b.hash;
+                  });
+
+        // Process each hash bucket
+        size_t i = 0;
+        while (i < entries.size()) {
+            size_t j = i + 1;
+            while (j < entries.size() && entries[j].hash == entries[i].hash)
+                ++j;
+            // entries[i..j) have the same hash
+            if (j - i > 1) {
+                // Verify exact equivalence: build residual row sets and compare
+                // Use first column as reference
+                const int ref_col = entries[i].col;
+                std::vector<int> ref_residual;
+                for (int r : adj.rows_by_col[static_cast<size_t>(ref_col)])
+                    if (r >= 0 && r < nrows && !row_decided[static_cast<size_t>(r)])
+                        ref_residual.push_back(r);
+
+                for (size_t k = i + 1; k < j; ++k) {
+                    const int cand = entries[k].col;
+                    // Build candidate residual and compare
+                    bool match = true;
+                    const auto &cand_rows = adj.rows_by_col[static_cast<size_t>(cand)];
+                    size_t ri = 0, ci = 0;
+                    // Both row lists are sorted; compare via merge
+                    const auto &ref_rows = adj.rows_by_col[static_cast<size_t>(ref_col)];
+                    ri = 0; ci = 0;
+                    size_t rr = 0; // index into ref_residual for validation
+                    // Rebuild residual for candidate inline and compare
+                    std::vector<int> cand_residual;
+                    for (int r : cand_rows)
+                        if (r >= 0 && r < nrows && !row_decided[static_cast<size_t>(r)])
+                            cand_residual.push_back(r);
+                    if (cand_residual != ref_residual)
+                        match = false;
+
+                    if (match) {
+                        fixings.push_back({cand, 0});
+                        col_state[static_cast<size_t>(cand)] = -1;
+                    }
+                }
+            }
+            i = j;
+        }
+    }
+    return fixings;
+}
 
 static void adopt_incumbent_solution(
     std::vector<double> &best_solution,
@@ -1214,6 +1361,17 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     ScpAdjacency cached_adj = build_adjacency(base);
     bool adj_valid = true;
 
+    // Build orbital fixing state for symmetry breaking
+    OrbitalFixingState orbital_state = build_orbital_state(base);
+    bool orbital_valid = true;
+    if (verbosity >= 2 && !orbital_state.cost_groups.empty()) {
+        int total_cols_in_groups = 0;
+        for (const auto &g : orbital_state.cost_groups)
+            total_cols_in_groups += static_cast<int>(g.size());
+        fprintf(stderr, "  Symmetry: %d cost groups, %d cols in groups\n",
+                static_cast<int>(orbital_state.cost_groups.size()), total_cols_in_groups);
+    }
+
     std::vector<BranchNodeState> nodes;
     std::unordered_map<int, HighsBasis> node_bases;
     {
@@ -1346,6 +1504,36 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
         }
 
+        // Orbital fixing: fix equivalent columns in the same symmetry class
+        if (!orbital_state.disabled &&
+            static_cast<int>(branch_node.decisions.size()) >= 2) {
+            if (!orbital_valid) {
+                orbital_state = build_orbital_state(base);
+                orbital_valid = true;
+            }
+            if (!orbital_state.cost_groups.empty()) {
+                if (!adj_valid) {
+                    cached_adj = build_adjacency(base);
+                    adj_valid = true;
+                }
+                const auto &effective = augmented_decisions.empty()
+                                            ? branch_node.decisions
+                                            : augmented_decisions;
+                auto orbit_fix = compute_orbital_fixings(cached_adj, effective, orbital_state);
+                if (!orbit_fix.empty()) {
+                    if (augmented_decisions.empty())
+                        augmented_decisions = branch_node.decisions;
+                    for (const auto &f : orbit_fix)
+                        augmented_decisions.push_back(f);
+                    orbital_state.total_fixed += static_cast<int>(orbit_fix.size());
+                }
+                // Auto-disable if no fixings found after initial probe period
+                ++orbital_state.calls;
+                if (orbital_state.calls >= 100 && orbital_state.total_fixed == 0)
+                    orbital_state.disabled = true;
+            }
+        }
+
         // Solve LP with per-node basis warm-start
         lp.apply_decisions(augmented_decisions.empty() ? branch_node.decisions : augmented_decisions);
         lp.add_cuts(branch_node.cuts);
@@ -1399,10 +1587,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 node_at_last_gap_improvement = processed_nodes;
                 frontier.prune(best_obj, tol, verbosity, &node_bases);
                 if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0) {
-                    lp.rebuild_model_keep_basis(base); adj_valid = false;
+                    lp.rebuild_model_keep_basis(base); adj_valid = false; orbital_valid = false;
                 }
                 if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0) {
-                    lp.rebuild_model_keep_basis(base); adj_valid = false;
+                    lp.rebuild_model_keep_basis(base); adj_valid = false; orbital_valid = false;
                 }
             }
         }
@@ -1423,10 +1611,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 }
                 frontier.prune(best_obj, tol, verbosity, &node_bases);
                 if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0) {
-                    lp.rebuild_model_keep_basis(base); adj_valid = false;
+                    lp.rebuild_model_keep_basis(base); adj_valid = false; orbital_valid = false;
                 }
                 if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0) {
-                    lp.rebuild_model_keep_basis(base); adj_valid = false;
+                    lp.rebuild_model_keep_basis(base); adj_valid = false; orbital_valid = false;
                 }
             }
             continue;
@@ -1603,7 +1791,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     if (total_cuts > 0) {
                         // Rebuild to sync base model with LP
                         lp.rebuild_model(base);
-                        adj_valid = false;
+                        adj_valid = false; orbital_valid = false;
 
                         // Validate: check if cuts improved the tightened dual
                         double post_cut_dual = sol.optimal ? sol.dual_obj : pre_cut_dual;
