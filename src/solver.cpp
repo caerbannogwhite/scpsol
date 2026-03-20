@@ -2,6 +2,7 @@
 #include "balas.h"
 #include "bnb.h"
 #include "cuts.h"
+#include "decomposition.h"
 #include "heuristics.h"
 #include "lagrangian.h"
 #include "lp.h"
@@ -1372,6 +1373,16 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 static_cast<int>(orbital_state.cost_groups.size()), total_cols_in_groups);
     }
 
+    // Decomposition state (computed after all root preprocessing so linking
+    // columns are only among truly free variables, not RC-fixed ones)
+    DecompositionState decomp_state;
+    bool decomp_dynamic_eligible = (config.decomposition_mode == "auto");
+    if (config.decomposition_mode == "force" ||
+        (config.decomposition_mode == "auto" && base.ncols > 1000)) {
+        decomp_state = compute_decomposition(base, config.decomposition_max_linkers, verbosity);
+        decomp_dynamic_eligible = false;
+    }
+
     std::vector<BranchNodeState> nodes;
     std::unordered_map<int, HighsBasis> node_bases;
     {
@@ -1532,6 +1543,59 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 ++orbital_state.calls;
                 if (orbital_state.calls >= 100 && orbital_state.total_fixed == 0)
                     orbital_state.disabled = true;
+            }
+        }
+
+        // Decomposition: if all linking columns are decided, solve sub-problems.
+        // Pass augmented_decisions (branch + propagated + orbital + RC) to
+        // solve_decomposed so sub-problems see the full node state.
+        if (decomp_state.enabled) {
+            const auto &eff_dec = augmented_decisions.empty()
+                                      ? branch_node.decisions
+                                      : augmented_decisions;
+            if (all_linkers_fixed(decomp_state, eff_dec)) {
+                const double bnb_elapsed = std::chrono::duration<double>(
+                    Clock::now() - start_time).count();
+                const double remaining = (config.time_limit_seconds > 0)
+                    ? std::max(1.0, config.time_limit_seconds - bnb_elapsed)
+                    : 60.0;
+
+                auto dr = solve_decomposed(base, eff_dec, decomp_state,
+                                           best_obj, config, remaining, verbosity);
+                if (dr.solved) {
+                    // Sub-problems fully explored this subtree
+                    if (dr.improved) {
+                        best_obj = dr.combined_obj;
+                        adopt_incumbent_solution(best_solution, dr.combined_solution,
+                                                 base.ncols, ncols_input,
+                                                 base.active_to_original);
+                        incumbent_source = "decomposition";
+                        if (verbosity >= 2) {
+                            const double t = std::chrono::duration<double>(
+                                Clock::now() - start_time).count();
+                            fprintf(stderr,
+                                "* [%8.3fs] New incumbent: %.8f (from decomposition)\n",
+                                t, best_obj);
+                        }
+                        node_at_last_gap_improvement = processed_nodes;
+                        frontier.prune(best_obj, tol, verbosity, &node_bases);
+                        if (mid_bnb_column_removal(base, best_obj, tol, frontier,
+                                                    nodes, verbosity, &pc_state) > 0) {
+                            lp.rebuild_model_keep_basis(base);
+                            adj_valid = false; orbital_valid = false;
+                        }
+                        if (mid_bnb_budget_pruning(base, best_obj, tol,
+                                                    config.preprocess_time_limit,
+                                                    frontier, nodes, verbosity,
+                                                    &pc_state) > 0) {
+                            lp.rebuild_model_keep_basis(base);
+                            adj_valid = false; orbital_valid = false;
+                        }
+                    }
+                    continue; // skip LP solve/branch — subtree handled
+                }
+                // Decomposition failed (infeasible block or no split):
+                // fall through to normal LP solve + branching
             }
         }
 
@@ -1721,20 +1785,32 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         }
 
         if (!used_balas) {
-            int branch_var;
-            if (use_reliability) {
-                int sb_lps = 0;
-                if (!adj_valid) {
-                    cached_adj = build_adjacency(base);
-                    adj_valid = true;
+            int branch_var = -1;
+
+            // Priority: branch on unfixed linking columns first
+            if (decomp_state.enabled) {
+                const auto &eff_dec = augmented_decisions.empty()
+                                          ? branch_node.decisions
+                                          : augmented_decisions;
+                branch_var = pick_linking_branch_var(
+                    decomp_state, eff_dec, fractional);
+            }
+
+            if (branch_var < 0) {
+                if (use_reliability) {
+                    int sb_lps = 0;
+                    if (!adj_valid) {
+                        cached_adj = build_adjacency(base);
+                        adj_valid = true;
+                    }
+                    branch_var = reliability_branch_select(
+                        pc_state, lp, base, branch_node, sol, fractional,
+                        best_obj, config.reliability_eta, config.reliability_max_sb,
+                        integ_tol, verbosity, sb_lps, &cached_adj);
+                    total_lp_solves += sb_lps;
+                } else {
+                    branch_var = selector->select(sol.col_value, base.obj, fractional);
                 }
-                branch_var = reliability_branch_select(
-                    pc_state, lp, base, branch_node, sol, fractional,
-                    best_obj, config.reliability_eta, config.reliability_max_sb,
-                    integ_tol, verbosity, sb_lps, &cached_adj);
-                total_lp_solves += sb_lps;
-            } else {
-                branch_var = selector->select(sol.col_value, base.obj, fractional);
             }
             if (branch_var < 0) continue;
 
@@ -1783,6 +1859,17 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
 
             if (processed_nodes - node_at_last_gap_improvement >= gap_stagnation_window) {
                 node_at_last_gap_improvement = processed_nodes;
+
+                // Dynamic decomposition activation after ~150s of BnB
+                if (!decomp_state.enabled && decomp_dynamic_eligible) {
+                    const double bnb_elapsed = std::chrono::duration<double>(
+                        Clock::now() - start_time).count();
+                    if (bnb_elapsed > 150.0) {
+                        decomp_state = compute_decomposition(
+                            base, config.decomposition_max_linkers, verbosity);
+                        decomp_dynamic_eligible = false;
+                    }
+                }
 
                 // Track frontier trend
                 bool frontier_shrinking = false;
