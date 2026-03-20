@@ -765,7 +765,17 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     lp.build_model(base);
     int total_lp_solves = 0;
 
-    LpSolution root_sol = lp.solve();
+    // Root LP: use IPM for large models, simplex otherwise
+    bool use_ipm_root = (config.root_lp_solver == "ipm") ||
+        (config.root_lp_solver == "auto" && base.ncols >= 500 && base.nrows >= 200);
+    LpSolution root_sol;
+    if (use_ipm_root) {
+        if (verbosity >= 2)
+            fprintf(stderr, "  Root LP solver: IPM (barrier) with crossover\n");
+        root_sol = lp.solve_ipm();
+    } else {
+        root_sol = lp.solve();
+    }
     ++total_lp_solves;
 
     if (root_sol.solved && root_sol.optimal) {

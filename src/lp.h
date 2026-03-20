@@ -13,6 +13,7 @@ public:
     void add_cuts(const std::vector<CutConstraint> &cuts);
     void restore_base_state();
     LpSolution solve();
+    LpSolution solve_ipm(); // barrier/interior-point with crossover
     void save_basis();
     void restore_basis();
     HighsBasis get_basis() const;

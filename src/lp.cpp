@@ -125,6 +125,37 @@ void LpSolver::restore_base_state() {
     }
 }
 
+LpSolution LpSolver::solve_ipm() {
+    LpSolution sol;
+
+    // Switch to IPM with crossover to get a basic feasible solution
+    highs_.setOptionValue("solver", "ipm");
+    highs_.setOptionValue("run_crossover", "on");
+
+    HighsStatus status = highs_.run();
+    const HighsInfo &info = highs_.getInfo();
+    const HighsModelStatus model_status = highs_.getModelStatus();
+
+    sol.solved = (status == HighsStatus::kOk);
+    sol.optimal = (model_status == HighsModelStatus::kOptimal);
+    sol.infeasible = (model_status == HighsModelStatus::kInfeasible);
+
+    if (sol.solved && sol.optimal) {
+        sol.primal_obj = info.objective_function_value;
+        sol.dual_obj = info.objective_function_value;
+
+        const HighsSolution &hs = highs_.getSolution();
+        sol.col_value = hs.col_value;
+        sol.row_dual = hs.row_dual;
+        sol.col_dual = hs.col_dual;
+    }
+
+    // Switch back to simplex for subsequent BnB node solves
+    highs_.setOptionValue("solver", "simplex");
+
+    return sol;
+}
+
 LpSolution LpSolver::solve() {
     LpSolution sol;
 
