@@ -17,6 +17,7 @@ static void print_usage(const char *progname) {
             "  --time-limit S      Time limit in seconds (default 0 = unlimited)\n"
             "  --cut-frequency F   Cut frequency 0.0-1.0 (default 0.0, 0=disable)\n"
             "  --balas-frequency F Balas frequency 0.0-1.0 (default 0.6, 0=disable)\n"
+            "  --lagrangian-frequency F  Node Lagrangian heuristic 0.0-1.0 (default 0.0, 0=disable)\n"
             "  --cut-rounds N      Mid-BnB cut rounds per event (default 3)\n"
             "  --branch STRATEGY   Branch strategy: reliability, most_fractional, highest_cost (default reliability)\n"
             "  --reliability-eta N Reliability parameter (default 4)\n"
@@ -47,6 +48,8 @@ int main(int argc, char *argv[]) {
             config.mid_bnb_cut_frequency = atof(argv[++i]);
         } else if (strcmp(argv[i], "--balas-frequency") == 0 && i + 1 < argc) {
             config.aggressive_balas_frequency = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--lagrangian-frequency") == 0 && i + 1 < argc) {
+            config.lagrangian_frequency = atof(argv[++i]);
         } else if (strcmp(argv[i], "--cut-rounds") == 0 && i + 1 < argc) {
             config.mid_bnb_cut_rounds = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--show-solution") == 0) {

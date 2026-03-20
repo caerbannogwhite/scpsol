@@ -106,6 +106,7 @@ struct SolverConfig {
     int gap_stagnation_window = 50;
     double mid_bnb_cut_frequency = 0.0;
     double aggressive_balas_frequency = 0.6;
+    double lagrangian_frequency = 0.0; // 0.0 = disabled, 1.0 = every node
     int mid_bnb_cut_rounds = 3;
     int heuristic_frequency = 10;
     double integrality_tol = 1e-6;

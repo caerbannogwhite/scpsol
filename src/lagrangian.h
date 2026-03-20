@@ -23,6 +23,15 @@ LagrangianResult lagrangian_relaxation(
     double time_limit,
     int verbosity);
 
+// Node-level variant: respects branch fixings from decisions.
+LagrangianResult lagrangian_relaxation_at_node(
+    const BaseRelaxationModel &base,
+    double incumbent_obj,
+    const std::vector<double> &init_multipliers,
+    const std::vector<BranchDecision> &decisions,
+    int max_iterations,
+    double time_limit);
+
 } // namespace scpsol
 
 #endif // SCPSOL_LAGRANGIAN_H

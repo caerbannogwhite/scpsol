@@ -1400,6 +1400,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
 
     double cut_accumulator = 0.0;
     double balas_accumulator = 0.0;
+    double lagrangian_accumulator = 0.0;
     size_t frontier_at_last_stagnation = 0;
     int frontier_shrink_streak = 0;
     bool force_aggressive_branching = false;
@@ -1591,6 +1592,54 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 }
                 if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0) {
                     lp.rebuild_model_keep_basis(base); adj_valid = false; orbital_valid = false;
+                }
+            }
+        }
+
+        // Node-level Lagrangian heuristic
+        if (config.lagrangian_frequency > 0.0 && sol.optimal &&
+            static_cast<int>(sol.row_dual.size()) >= base.nrows) {
+            lagrangian_accumulator += config.lagrangian_frequency;
+            if (lagrangian_accumulator >= 1.0) {
+                lagrangian_accumulator -= 1.0;
+
+                const auto &eff_dec = augmented_decisions.empty()
+                                          ? branch_node.decisions
+                                          : augmented_decisions;
+
+                auto lagr = lagrangian_relaxation_at_node(
+                    base, best_obj, sol.row_dual, eff_dec,
+                    50,   // max_iterations (reduced from 500)
+                    0.5); // time_limit (reduced from 5.0)
+
+                if (lagr.best_heuristic_obj < best_obj - tol &&
+                    !lagr.best_solution.empty()) {
+                    best_obj = lagr.best_heuristic_obj;
+                    adopt_incumbent_solution(best_solution, lagr.best_solution,
+                                             base.ncols, ncols_input,
+                                             base.active_to_original);
+                    incumbent_source = "node_lagrangian";
+                    if (verbosity >= 2) {
+                        const double t = std::chrono::duration<double>(
+                            Clock::now() - start_time).count();
+                        fprintf(stderr,
+                            "* [%8.3fs] New incumbent: %.8f (from node_lagrangian)\n",
+                            t, best_obj);
+                    }
+                    node_at_last_gap_improvement = processed_nodes;
+                    frontier.prune(best_obj, tol, verbosity, &node_bases);
+                    if (mid_bnb_column_removal(base, best_obj, tol, frontier,
+                                                nodes, verbosity, &pc_state) > 0) {
+                        lp.rebuild_model_keep_basis(base);
+                        adj_valid = false; orbital_valid = false;
+                    }
+                    if (mid_bnb_budget_pruning(base, best_obj, tol,
+                                                config.preprocess_time_limit,
+                                                frontier, nodes, verbosity,
+                                                &pc_state) > 0) {
+                        lp.rebuild_model_keep_basis(base);
+                        adj_valid = false; orbital_valid = false;
+                    }
                 }
             }
         }
