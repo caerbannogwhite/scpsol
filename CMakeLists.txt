@@ -24,7 +24,8 @@ add_executable(scpsol
     src/bnb.cpp
     src/reliability.cpp
     src/lagrangian.cpp
-    src/decomposition.cpp)
+    src/decomposition.cpp
+    src/diving.cpp)
 target_include_directories(scpsol PRIVATE src)
 target_link_libraries(scpsol PRIVATE highs)
 

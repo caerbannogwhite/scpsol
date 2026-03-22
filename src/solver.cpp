@@ -3,6 +3,7 @@
 #include "bnb.h"
 #include "cuts.h"
 #include "decomposition.h"
+#include "diving.h"
 #include "heuristics.h"
 #include "lagrangian.h"
 #include "lp.h"
@@ -1422,6 +1423,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     double cut_accumulator = 0.0;
     double balas_accumulator = 0.0;
     double lagrangian_accumulator = 0.0;
+    double diving_accumulator = 0.0;
     size_t frontier_at_last_stagnation = 0;
     int frontier_shrink_streak = 0;
     bool force_aggressive_branching = false;
@@ -1699,6 +1701,49 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                         fprintf(stderr,
                             "* [%8.3fs] New incumbent: %.8f (from node_lagrangian)\n",
                             t, best_obj);
+                    }
+                    node_at_last_gap_improvement = processed_nodes;
+                    frontier.prune(best_obj, tol, verbosity, &node_bases);
+                    if (mid_bnb_column_removal(base, best_obj, tol, frontier,
+                                                nodes, verbosity, &pc_state) > 0) {
+                        lp.rebuild_model_keep_basis(base);
+                        adj_valid = false; orbital_valid = false;
+                    }
+                    if (mid_bnb_budget_pruning(base, best_obj, tol,
+                                                config.preprocess_time_limit,
+                                                frontier, nodes, verbosity,
+                                                &pc_state) > 0) {
+                        lp.rebuild_model_keep_basis(base);
+                        adj_valid = false; orbital_valid = false;
+                    }
+                }
+            }
+        }
+
+        // Diving heuristic
+        if (config.diving_frequency > 0.0 && sol.optimal &&
+            node_dual_bound < best_obj - tol) {
+            diving_accumulator += config.diving_frequency;
+            if (diving_accumulator >= 1.0) {
+                diving_accumulator -= 1.0;
+
+                auto dive = run_diving_heuristics(
+                    lp, base, branch_node, sol, best_obj, integ_tol,
+                    config.diving_max_lp_solves);
+                total_lp_solves += dive.lp_solves;
+
+                if (dive.found && dive.objective < best_obj - tol) {
+                    best_obj = dive.objective;
+                    adopt_incumbent_solution(best_solution, dive.solution,
+                                             base.ncols, ncols_input,
+                                             base.active_to_original);
+                    incumbent_source = dive.strategy_name;
+                    if (verbosity >= 2) {
+                        const double t = std::chrono::duration<double>(
+                            Clock::now() - start_time).count();
+                        fprintf(stderr,
+                            "* [%8.3fs] New incumbent: %.8f (from %s)\n",
+                            t, best_obj, dive.strategy_name.c_str());
                     }
                     node_at_last_gap_improvement = processed_nodes;
                     frontier.prune(best_obj, tol, verbosity, &node_bases);

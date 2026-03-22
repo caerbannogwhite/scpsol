@@ -107,6 +107,8 @@ struct SolverConfig {
     double mid_bnb_cut_frequency = 0.0;
     double aggressive_balas_frequency = 0.6;
     double lagrangian_frequency = 0.0; // 0.0 = disabled, 1.0 = every node
+    double diving_frequency = 0.0; // 0.0 = disabled, 1.0 = every node
+    int diving_max_lp_solves = 50;
     std::string root_lp_solver = "auto"; // "simplex", "ipm", "auto"
     std::string decomposition_mode = "off"; // "off", "auto", "force"
     int decomposition_max_linkers = 20;

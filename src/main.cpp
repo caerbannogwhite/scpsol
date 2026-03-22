@@ -18,6 +18,8 @@ static void print_usage(const char *progname) {
             "  --cut-frequency F   Cut frequency 0.0-1.0 (default 0.0, 0=disable)\n"
             "  --balas-frequency F Balas frequency 0.0-1.0 (default 0.6, 0=disable)\n"
             "  --lagrangian-frequency F  Node Lagrangian heuristic 0.0-1.0 (default 0.0, 0=disable)\n"
+            "  --diving-frequency F  Diving heuristic 0.0-1.0 (default 0.0, 0=disable)\n"
+            "  --diving-max-lps N    Max LP solves per dive (default 50)\n"
             "  --root-lp-solver MODE Root LP: simplex, ipm, auto (default auto)\n"
             "  --decomposition MODE  Decomposition: off, auto, force (default off)\n"
             "  --decomp-max-linkers N  Max linking columns (default 20)\n"
@@ -53,6 +55,10 @@ int main(int argc, char *argv[]) {
             config.aggressive_balas_frequency = atof(argv[++i]);
         } else if (strcmp(argv[i], "--lagrangian-frequency") == 0 && i + 1 < argc) {
             config.lagrangian_frequency = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--diving-frequency") == 0 && i + 1 < argc) {
+            config.diving_frequency = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--diving-max-lps") == 0 && i + 1 < argc) {
+            config.diving_max_lp_solves = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--root-lp-solver") == 0 && i + 1 < argc) {
             config.root_lp_solver = argv[++i];
         } else if (strcmp(argv[i], "--decomposition") == 0 && i + 1 < argc) {
