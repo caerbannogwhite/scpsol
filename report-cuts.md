@@ -93,22 +93,25 @@ The Balas Cut Generation (BCG) algorithm, implemented in `balas_cut_generate()`,
 - LP primal and dual solutions
 - Reduced costs $\bar{c}_j$
 - Set $S$ of candidate variables: fractional ($\bar{x}_j > \epsilon$) with positive reduced cost ($\bar{c}_j > \epsilon$)
-- Tight rows $T = \{i : \sum_j A_{ij} \bar{x}_j \approx b_i\}$ (binding constraints)
+- Tight rows $T$ = binding constraints where $\sum_j A_{ij} \bar{x}_j \approx 1$
 - Incumbent bound $z^*$
+
+Let $N_i = \{j : A_{ij} = 1\}$ denote the set of columns covering row $i$.
 
 **Algorithm:**
 
-1. Initialize: working set $S$, cut set $W = \emptyset$, set $Q = \emptyset$, dual progress $y = 0$
+1. Initialize: working set $S$, cut set $W = \emptyset$, dual progress $y = 0$
 2. While $S \neq \emptyset$ and $y < z^*$:
-   a. Compute gap $= z^* - y$
-   b. Find threshold $v_t = \min\{\bar{c}_j : j \in S, \bar{c}_j \geq \text{gap}\}$ (or $\max\{\bar{c}_j : j \in S\}$ if no column reaches the gap)
-   c. Let $J = \{j \in S : \bar{c}_j \approx v_t\}$ (columns at the threshold)
-   d. Let $Q = \{j : \bar{c}_j \geq v_t\}$ (columns at or above threshold)
-   e. Find row $i^* \in T$ covered by some column in $J$, minimizing $|N_{i^*} \setminus Q \setminus W|$ (fewest new variables to add)
-   f. Find column $j^* \in J$ covering $i^*$
-   g. Add $N_{i^*} \setminus Q$ to cut set $W$
-   h. Update: $y \leftarrow y + \bar{c}_{j^*}$; for all $j \in N_{i^*} \cap Q$: $\bar{c}_j \leftarrow \bar{c}_j - \bar{c}_{j^*}$
-   i. Remove $j^*$ from $S$
+   1. Compute gap = $z^* - y$
+   2. Find threshold $v_t$: the smallest reduced cost in $S$ that reaches the gap, i.e., $v_t = \min\{\bar{c}_j : j \in S,\; \bar{c}_j \geq \text{gap}\}$. If no column reaches the gap, use $v_t = \max\{\bar{c}_j : j \in S\}$
+   3. Let $J = \{j \in S : \bar{c}_j \approx v_t\}$ (columns at the threshold)
+   4. Let $Q = \{j : \bar{c}_j \geq v_t\}$ (columns at or above threshold)
+   5. Find row $i^{\star} \in T$ covered by some column in $J$, choosing the row that minimizes the number of new variables added: $|N_{i^{\star}} \setminus (Q \cup W)|$
+   6. Find column $j^{\star} \in J$ covering row $i^{\star}$
+   7. Add columns $N_{i^{\star}} \setminus Q$ to the cut set $W$
+   8. Update dual progress: $y \leftarrow y + \bar{c}_{j^{\star}}$
+   9. For all $j \in N_{i^{\star}} \cap Q$: reduce $\bar{c}_j \leftarrow \bar{c}_j - \bar{c}_{j^{\star}}$
+   10. Remove $j^{\star}$ from $S$
 3. If $y \geq z^*$: return cover cut $\sum_{j \in W} x_j \geq 1$, else no cut found
 
 **Intuition:** The algorithm greedily builds a cover by exploiting the dual structure. At each step, it identifies a tight constraint whose covering columns have high reduced costs, adds the cheapest columns (in the reduced-cost sense) to the cut, and subtracts their contribution from remaining candidates. The procedure succeeds when the accumulated reduced cost reaches the incumbent bound, guaranteeing the cut is valid.
