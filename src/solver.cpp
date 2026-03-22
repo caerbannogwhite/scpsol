@@ -1430,6 +1430,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     std::vector<double> incumbent_active;
     size_t frontier_at_last_stagnation = 0;
     int frontier_shrink_streak = 0;
+    bool proving_phase = false; // true when frontier monotonically decreasing
     bool force_aggressive_branching = false;
     auto cut_separators = make_cut_separators();
 
@@ -1724,8 +1725,8 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
         }
 
-        // Diving heuristic
-        if (config.diving_frequency > 0.0 && sol.optimal &&
+        // Diving heuristic (skip in proving phase — frontier shrinking)
+        if (config.diving_frequency > 0.0 && sol.optimal && !proving_phase &&
             node_dual_bound < best_obj - tol) {
             diving_accumulator += config.diving_frequency;
             if (diving_accumulator >= 1.0) {
@@ -1767,8 +1768,8 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
         }
 
-        // RINS heuristic
-        if (config.rins_frequency > 0.0 && sol.optimal &&
+        // RINS heuristic (skip in proving phase — frontier shrinking)
+        if (config.rins_frequency > 0.0 && sol.optimal && !proving_phase &&
             !best_solution.empty() && node_dual_bound < best_obj - tol) {
             rins_accumulator += config.rins_frequency;
             if (rins_accumulator >= 1.0) {
@@ -1987,15 +1988,36 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     }
                 }
 
-                // Track frontier trend
-                bool frontier_shrinking = false;
+                // Track frontier trend with hysteresis:
+                // Enter proving phase after 5 consecutive shrinks (sustained trend).
+                // Exit only after 3 consecutive growths (avoid oscillation).
                 if (frontier_at_last_stagnation > 0) {
-                    if (frontier.size() < frontier_at_last_stagnation)
-                        ++frontier_shrink_streak;
-                    else
-                        frontier_shrink_streak = 0;
-                    frontier_shrinking = (frontier_shrink_streak >= 2);
+                    if (frontier.size() < frontier_at_last_stagnation) {
+                        frontier_shrink_streak = std::max(1, frontier_shrink_streak + 1);
+                    } else {
+                        frontier_shrink_streak = std::min(-1, frontier_shrink_streak - 1);
+                    }
                 }
+                if (!proving_phase && frontier_shrink_streak >= 5) {
+                    proving_phase = true;
+                    if (verbosity >= 2) {
+                        const double t = std::chrono::duration<double>(
+                            Clock::now() - start_time).count();
+                        fprintf(stderr,
+                            "  [%8.3fs] Proving phase: frontier shrinking, "
+                            "disabling expensive heuristics\n", t);
+                    }
+                }
+                if (proving_phase && frontier_shrink_streak <= -3) {
+                    proving_phase = false;
+                    if (verbosity >= 2) {
+                        const double t = std::chrono::duration<double>(
+                            Clock::now() - start_time).count();
+                        fprintf(stderr,
+                            "  [%8.3fs] Exiting proving phase: frontier growing\n", t);
+                    }
+                }
+                const bool frontier_shrinking = (frontier_shrink_streak >= 2);
                 frontier_at_last_stagnation = frontier.size();
 
                 // Mid-BnB cuts (skip if frontier is naturally shrinking)
