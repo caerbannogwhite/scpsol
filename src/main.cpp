@@ -19,6 +19,7 @@ static void print_usage(const char *progname) {
             "  --balas-frequency F Balas frequency 0.0-1.0 (default 0.6, 0=disable)\n"
             "  --lagrangian-frequency F  Node Lagrangian heuristic 0.0-1.0 (default 0.0, 0=disable)\n"
             "  --diving-frequency F  Diving heuristic 0.0-1.0 (default 0.0, 0=disable)\n"
+            "  --rins-frequency F    RINS heuristic 0.0-1.0 (default 0.0, 0=disable)\n"
             "  --diving-max-lps N    Max LP solves per dive (default 50)\n"
             "  --root-lp-solver MODE Root LP: simplex, ipm, auto (default auto)\n"
             "  --decomposition MODE  Decomposition: off, auto, force (default off)\n"
@@ -57,6 +58,8 @@ int main(int argc, char *argv[]) {
             config.lagrangian_frequency = atof(argv[++i]);
         } else if (strcmp(argv[i], "--diving-frequency") == 0 && i + 1 < argc) {
             config.diving_frequency = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--rins-frequency") == 0 && i + 1 < argc) {
+            config.rins_frequency = atof(argv[++i]);
         } else if (strcmp(argv[i], "--diving-max-lps") == 0 && i + 1 < argc) {
             config.diving_max_lp_solves = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--root-lp-solver") == 0 && i + 1 < argc) {

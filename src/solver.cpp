@@ -5,6 +5,7 @@
 #include "decomposition.h"
 #include "diving.h"
 #include "heuristics.h"
+#include "rins.h"
 #include "lagrangian.h"
 #include "lp.h"
 #include "preprocessor.h"
@@ -1424,6 +1425,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     double balas_accumulator = 0.0;
     double lagrangian_accumulator = 0.0;
     double diving_accumulator = 0.0;
+    double rins_accumulator = 0.0;
+    // Incumbent in active column space (for RINS comparison with LP)
+    std::vector<double> incumbent_active;
     size_t frontier_at_last_stagnation = 0;
     int frontier_shrink_streak = 0;
     bool force_aggressive_branching = false;
@@ -1744,6 +1748,63 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                         fprintf(stderr,
                             "* [%8.3fs] New incumbent: %.8f (from %s)\n",
                             t, best_obj, dive.strategy_name.c_str());
+                    }
+                    node_at_last_gap_improvement = processed_nodes;
+                    frontier.prune(best_obj, tol, verbosity, &node_bases);
+                    if (mid_bnb_column_removal(base, best_obj, tol, frontier,
+                                                nodes, verbosity, &pc_state) > 0) {
+                        lp.rebuild_model_keep_basis(base);
+                        adj_valid = false; orbital_valid = false;
+                    }
+                    if (mid_bnb_budget_pruning(base, best_obj, tol,
+                                                config.preprocess_time_limit,
+                                                frontier, nodes, verbosity,
+                                                &pc_state) > 0) {
+                        lp.rebuild_model_keep_basis(base);
+                        adj_valid = false; orbital_valid = false;
+                    }
+                }
+            }
+        }
+
+        // RINS heuristic
+        if (config.rins_frequency > 0.0 && sol.optimal &&
+            !best_solution.empty() && node_dual_bound < best_obj - tol) {
+            rins_accumulator += config.rins_frequency;
+            if (rins_accumulator >= 1.0) {
+                rins_accumulator -= 1.0;
+
+                // Build incumbent in active column space (lazy)
+                incumbent_active.assign(static_cast<size_t>(base.ncols), 0.0);
+                for (int j = 0; j < base.ncols; ++j) {
+                    const int orig = base.active_to_original[static_cast<size_t>(j)];
+                    if (orig >= 0 && orig < ncols_input &&
+                        best_solution[static_cast<size_t>(orig)] > 0.5)
+                        incumbent_active[static_cast<size_t>(j)] = 1.0;
+                }
+
+                const double bnb_elapsed = std::chrono::duration<double>(
+                    Clock::now() - start_time).count();
+                const double remaining = (config.time_limit_seconds > 0)
+                    ? std::max(1.0, config.time_limit_seconds - bnb_elapsed)
+                    : 30.0;
+
+                auto rr = run_rins(base, sol, incumbent_active, best_obj,
+                                   config, std::min(remaining, 30.0), verbosity);
+                total_lp_solves += rr.sub_lp_solves;
+
+                if (rr.found && rr.objective < best_obj - tol) {
+                    best_obj = rr.objective;
+                    adopt_incumbent_solution(best_solution, rr.solution,
+                                             base.ncols, ncols_input,
+                                             base.active_to_original);
+                    incumbent_source = "rins";
+                    if (verbosity >= 2) {
+                        const double t = std::chrono::duration<double>(
+                            Clock::now() - start_time).count();
+                        fprintf(stderr,
+                            "* [%8.3fs] New incumbent: %.8f (from rins)\n",
+                            t, best_obj);
                     }
                     node_at_last_gap_improvement = processed_nodes;
                     frontier.prune(best_obj, tol, verbosity, &node_bases);
