@@ -16,7 +16,23 @@ echo "instance,status,primal,dual,mip_gap_pct,nodes,lp_solves,wall_time_s" > "$O
 for f in $INSTANCES; do
     name=$(basename "$f" .txt)
     printf "%-10s " "$name"
-    result=$("$SOLVER" "$f" --time-limit "$TLIMIT" --verbosity 0 2>&1)
+    # A run whose output is empty or incomplete (see issue #2) is retried
+    # instead of silently producing a blank CSV row.
+    result=""
+    for attempt in 1 2 3; do
+        result=$("$SOLVER" "$f" --time-limit "$TLIMIT" --verbosity 0 2>&1)
+        rc=$?
+        if [ $rc -eq 0 ] && echo "$result" | grep -q '^Status:'; then
+            break
+        fi
+        echo "  (attempt $attempt: exit code $rc, ${#result} bytes of output; retrying)" >&2
+        result=""
+    done
+    if [ -z "$result" ]; then
+        echo "FAILED: no result after 3 attempts"
+        echo "$name,Failed,,,,,," >> "$OUTFILE"
+        continue
+    fi
     status=$(echo "$result" | sed -n 's/^Status:[[:space:]]*//p' | tr -d '\r')
     primal=$(echo "$result" | sed -n 's/^Primal:[[:space:]]*//p' | tr -d '\r')
     dual=$(echo "$result" | sed -n 's/^Dual:[[:space:]]*//p' | tr -d '\r')

@@ -68,6 +68,19 @@ The binary is placed in `build/Release/scpsol.exe` (Windows) or `build/scpsol` (
 
 HiGHS v1.9.0 is fetched automatically via CMake FetchContent.
 
+### Tests
+
+The regression suite in `tests/` runs the solver on the 30 core OR-Library
+instances, the demo instances, fractional-cost and malformed inputs, and every
+optional feature flag, checking status and objective against known optima:
+
+```bash
+ctest --test-dir build -C Release            # all (about 40 s in Release)
+ctest --test-dir build -C Release -L core    # labels: core, demo, fractional, error, features, regression
+```
+
+The same suite runs in GitHub Actions on Linux and Windows for every push and pull request.
+
 ## Usage
 
 ```bash
