@@ -1134,6 +1134,8 @@ BnbOutcome run_branch_and_bound(SolverRun &R) {
             const int id = static_cast<int>(nodes.size());
             nodes.push_back(std::move(requeue));
             frontier.push(id);
+            if (verbosity >= 3)
+                fprintf(stderr, "           Current node re-enqueued after column renumbering\n");
         }
         return true;
     };

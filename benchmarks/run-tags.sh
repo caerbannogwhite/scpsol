@@ -65,7 +65,15 @@ for tag in "${TAGS[@]}"; do
         # Use absolute path for data file since we may be at different checkout
         ABS_F="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
 
-        result=$("$SOLVER" "$ABS_F" --time-limit "$TLIMIT" --verbosity 0 2>&1) || true
+        # Retry runs whose output is empty or incomplete (see issue #2)
+        result=""
+        for attempt in 1 2 3; do
+            result=$("$SOLVER" "$ABS_F" --time-limit "$TLIMIT" --verbosity 0 2>&1) || true
+            if echo "$result" | grep -q '^Status:'; then
+                break
+            fi
+            result=""
+        done
         status=$(echo "$result" | sed -n 's/^Status:[[:space:]]*//p' | tr -d '\r')
         primal=$(echo "$result" | sed -n 's/^Primal:[[:space:]]*//p' | tr -d '\r')
         dual=$(echo "$result" | sed -n 's/^Dual:[[:space:]]*//p' | tr -d '\r')

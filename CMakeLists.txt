@@ -31,6 +31,12 @@ add_executable(scpsol
 target_include_directories(scpsol PRIVATE src)
 target_link_libraries(scpsol PRIVATE highs)
 
+option(SCPSOL_BUILD_TESTS "Register the regression test suite with CTest" ON)
+if(SCPSOL_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 if(EMSCRIPTEN)
     set(CMAKE_EXECUTABLE_SUFFIX ".js")
     target_link_options(scpsol PRIVATE
