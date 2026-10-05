@@ -1,31 +1,38 @@
 #include "solver.h"
 #include "balas.h"
 #include "bnb.h"
+#include "compact.h"
 #include "cuts.h"
 #include "decomposition.h"
 #include "diving.h"
 #include "heuristics.h"
-#include "rins.h"
 #include "lagrangian.h"
 #include "lp.h"
 #include "preprocessor.h"
 #include "reliability.h"
+#include "rins.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
-#include <functional>
 #include <limits>
-#include <random>
-#include <unordered_map>
 #include <memory>
-#include <queue>
+#include <numeric>
+#include <random>
 #include <string>
+#include <unordered_map>
 
 namespace scpsol {
+namespace {
 
-// ---- Symmetry breaking: orbital fixing ----
+using Clock = std::chrono::steady_clock;
+constexpr double kInf = std::numeric_limits<double>::infinity();
+
+// ======================================================================
+// Symmetry breaking: orbital fixing
+// ======================================================================
 // Columns with the same cost that cover the same set of *undecided* rows
 // at a BnB node are interchangeable. We keep one representative per
 // equivalence class and fix the rest to 0.
@@ -43,8 +50,7 @@ struct OrbitalFixingState {
     std::vector<uint8_t> row_decided_buf;
 };
 
-static OrbitalFixingState build_orbital_state(
-    const BaseRelaxationModel &base) {
+OrbitalFixingState build_orbital_state(const BaseRelaxationModel &base) {
     OrbitalFixingState state;
 
     // Build Zobrist hash table
@@ -68,7 +74,7 @@ static OrbitalFixingState build_orbital_state(
 
 // Compute orbital fixings at a BnB node.
 // Returns additional decisions (fix_value=0) for equivalent columns.
-static std::vector<BranchDecision> compute_orbital_fixings(
+std::vector<BranchDecision> compute_orbital_fixings(
     const ScpAdjacency &adj,
     const std::vector<BranchDecision> &decisions,
     OrbitalFixingState &state) {
@@ -143,23 +149,11 @@ static std::vector<BranchDecision> compute_orbital_fixings(
 
                 for (size_t k = i + 1; k < j; ++k) {
                     const int cand = entries[k].col;
-                    // Build candidate residual and compare
-                    bool match = true;
-                    const auto &cand_rows = adj.rows_by_col[static_cast<size_t>(cand)];
-                    size_t ri = 0, ci = 0;
-                    // Both row lists are sorted; compare via merge
-                    const auto &ref_rows = adj.rows_by_col[static_cast<size_t>(ref_col)];
-                    ri = 0; ci = 0;
-                    size_t rr = 0; // index into ref_residual for validation
-                    // Rebuild residual for candidate inline and compare
                     std::vector<int> cand_residual;
-                    for (int r : cand_rows)
+                    for (int r : adj.rows_by_col[static_cast<size_t>(cand)])
                         if (r >= 0 && r < nrows && !row_decided[static_cast<size_t>(r)])
                             cand_residual.push_back(r);
-                    if (cand_residual != ref_residual)
-                        match = false;
-
-                    if (match) {
+                    if (cand_residual == ref_residual) {
                         fixings.push_back({cand, 0});
                         col_state[static_cast<size_t>(cand)] = -1;
                     }
@@ -171,30 +165,14 @@ static std::vector<BranchDecision> compute_orbital_fixings(
     return fixings;
 }
 
-static void adopt_incumbent_solution(
-    std::vector<double> &best_solution,
-    const std::vector<double> &active_solution,
-    int ncols,
-    int ncols_input,
-    const std::vector<int> &active_to_original) {
-    best_solution.assign(static_cast<size_t>(ncols_input), 0.0);
-    const int copy_cols = std::min(ncols, static_cast<int>(active_solution.size()));
-    for (int j = 0; j < copy_cols; ++j) {
-        if (active_solution[static_cast<size_t>(j)] > 0.5) {
-            const int orig = active_to_original[static_cast<size_t>(j)];
-            if (orig >= 0 && orig < ncols_input) {
-                best_solution[static_cast<size_t>(orig)] = 1.0;
-            }
-        }
-    }
-}
-
+// ======================================================================
 // Best-bound frontier: nodes ordered by ascending parent_dual_bound.
 // Uses a vector managed as a min-heap for efficient best-bound selection.
+// ======================================================================
 struct BestBoundFrontier {
     std::vector<int> heap;
     const std::vector<BranchNodeState> *nodes_ptr = nullptr;
-    double min_raw_bound = std::numeric_limits<double>::infinity();
+    double min_raw_bound = kInf;
 
     void init(const std::vector<BranchNodeState> *np) { nodes_ptr = np; }
 
@@ -231,13 +209,14 @@ struct BestBoundFrontier {
         return idx;
     }
 
-    void prune(double best_obj, double tol, int verbosity,
+    // Drop every node whose bound cannot beat `cutoff` (reduced-space value).
+    void prune(double cutoff, double tol, int verbosity,
                std::unordered_map<int, HighsBasis> *bases = nullptr) {
-        const double prune_bound = best_obj - tol;
+        const double prune_bound = cutoff - tol;
         size_t before = heap.size();
         std::vector<int> surviving;
         surviving.reserve(heap.size());
-        min_raw_bound = std::numeric_limits<double>::infinity();
+        min_raw_bound = kInf;
         for (const int idx : heap) {
             const auto &nd = (*nodes_ptr)[static_cast<size_t>(idx)];
             if (nd.parent_dual_bound < prune_bound) {
@@ -262,7 +241,7 @@ struct BestBoundFrontier {
     }
 
     void recompute_min_raw() {
-        min_raw_bound = std::numeric_limits<double>::infinity();
+        min_raw_bound = kInf;
         for (const int idx : heap) {
             const double raw = (*nodes_ptr)[static_cast<size_t>(idx)].parent_dual_bound_raw;
             if (raw < min_raw_bound) min_raw_bound = raw;
@@ -270,20 +249,17 @@ struct BestBoundFrontier {
     }
 };
 
-static int mid_bnb_column_removal(
+// Apply a column renumbering produced by a mid-BnB reduction to every open
+// node, the pseudocosts and (optionally) the node currently being processed.
+void apply_mid_bnb_reduction(
+    const ModelReductionResult &reduction,
     BaseRelaxationModel &base,
-    double best_obj,
-    double tol,
     BestBoundFrontier &frontier,
     std::vector<BranchNodeState> &nodes,
-    int verbosity,
-    PseudocostState *pc_state = nullptr) {
-    ModelReductionResult reduction = reduce_base_model(base, best_obj, tol);
-    if (reduction.columns_removed <= 0) return 0;
+    PseudocostState *pc_state,
+    BranchNodeState *current_node,
+    bool *current_alive) {
     base.build_transpose();
-    if (verbosity >= 3)
-        fprintf(stderr, "           Mid-BnB reduction: %d cols removed, %d remaining\n",
-                reduction.columns_removed, base.ncols);
     std::vector<int> surviving;
     for (const int idx : frontier.heap) {
         if (remap_branch_node(nodes[static_cast<size_t>(idx)], reduction.old_to_new))
@@ -293,903 +269,724 @@ static int mid_bnb_column_removal(
     frontier.rebuild_heap();
     frontier.recompute_min_raw();
     if (pc_state) pc_state->remap(reduction.old_to_new, base.ncols);
+    if (current_node && current_alive && *current_alive)
+        *current_alive = remap_branch_node(*current_node, reduction.old_to_new);
+}
+
+int mid_bnb_column_removal(
+    BaseRelaxationModel &base,
+    double cutoff,
+    double tol,
+    BestBoundFrontier &frontier,
+    std::vector<BranchNodeState> &nodes,
+    int verbosity,
+    PseudocostState *pc_state,
+    BranchNodeState *current_node,
+    bool *current_alive) {
+    ModelReductionResult reduction = reduce_base_model(base, cutoff, tol);
+    if (reduction.columns_removed <= 0) return 0;
+    if (verbosity >= 3)
+        fprintf(stderr, "           Mid-BnB reduction: %d cols removed, %d remaining\n",
+                reduction.columns_removed, base.ncols);
+    apply_mid_bnb_reduction(reduction, base, frontier, nodes, pc_state, current_node, current_alive);
     return reduction.columns_removed;
 }
 
-static int mid_bnb_budget_pruning(
+int mid_bnb_budget_pruning(
     BaseRelaxationModel &base,
-    double best_obj,
+    double cutoff,
     double tol,
     double preprocess_time_limit,
     BestBoundFrontier &frontier,
     std::vector<BranchNodeState> &nodes,
     int verbosity,
-    PseudocostState *pc_state = nullptr) {
+    PseudocostState *pc_state,
+    BranchNodeState *current_node,
+    bool *current_alive) {
     ModelReductionResult reduction = reduce_base_model_budget_pruning(
-        base, best_obj, tol, preprocess_time_limit);
+        base, cutoff, tol, preprocess_time_limit);
     if (reduction.columns_removed <= 0) return 0;
-    base.build_transpose();
     if (verbosity >= 3)
         fprintf(stderr, "           Mid-BnB budget pruning: %d cols removed, %d remaining\n",
                 reduction.columns_removed, base.ncols);
-    std::vector<int> surviving;
-    for (const int idx : frontier.heap) {
-        if (remap_branch_node(nodes[static_cast<size_t>(idx)], reduction.old_to_new))
-            surviving.push_back(idx);
-    }
-    frontier.heap = std::move(surviving);
-    frontier.rebuild_heap();
-    frontier.recompute_min_raw();
-    if (pc_state) pc_state->remap(reduction.old_to_new, base.ncols);
+    apply_mid_bnb_reduction(reduction, base, frontier, nodes, pc_state, current_node, current_alive);
     return reduction.columns_removed;
 }
 
-static void apply_dominance_reduction(
-    int nrows, int &ncols,
-    std::vector<int> &csr_inds, std::vector<int> &csr_offs, std::vector<double> &csr_vals,
-    std::vector<double> &obj,
-    std::vector<int> &active_to_input,
-    const std::string &rules_config,
-    double tol, double time_limit_sec, int verbosity) {
-    if (ncols <= 0) return;
+// ======================================================================
+// Incumbent and shared solver state
+// ======================================================================
 
-    ColumnPreprocessContext ctx;
-    ctx.nrows = nrows;
-    ctx.ncols = ncols;
-    ctx.costs.assign(obj.begin(), obj.begin() + ncols);
-    ctx.active.assign(static_cast<size_t>(ncols), 1);
-    if (time_limit_sec > 0.0) {
-        ctx.deadline = std::chrono::steady_clock::now() +
-                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                           std::chrono::duration<double>(time_limit_sec));
+// The incumbent always lives in the column space of the input instance and
+// includes every column fixed during preprocessing. It is never "invalidated"
+// by model reductions: reductions only remove columns that cannot appear in
+// a strictly better solution, which the stored incumbent does not need.
+struct Incumbent {
+    double obj = kInf;              // total cost
+    std::vector<double> solution;   // one 0/1 entry per input column
+    std::string source = "none";
+};
+
+struct SolverRun {
+    const SolverConfig &config;
+    const int verbosity;
+    const double tol;
+    const double integ_tol;
+    const Clock::time_point start_time;
+    const int ncols_input;
+    const bool obj_is_integral;
+
+    // Reduced instance manipulated by root preprocessing.
+    WorkingModel wm;
+
+    Incumbent inc;
+    // Cost of the columns permanently fixed to 1 during preprocessing. The
+    // reduced models never see these columns, so every bound they produce is
+    // offset by this amount.
+    double fixed_cost = 0.0;
+    std::vector<int> fixed_original_cols;
+
+    // Dual bounds in reduced space (add fixed_cost for the original space).
+    double global_dual_bound = -kInf;     // tightened
+    double global_dual_bound_raw = -kInf; // raw LP value
+
+    BaseRelaxationModel base;
+    LpSolver lp;
+    LpSolution root_sol;
+    int total_lp_solves = 0;
+    std::vector<std::unique_ptr<IIntegerHeuristic>> heuristics;
+
+    SolverRun(const ScpInstance &instance, const SolverConfig &cfg)
+        : config(cfg),
+          verbosity(cfg.verbosity),
+          tol(cfg.feasibility_tol),
+          integ_tol(cfg.integrality_tol),
+          start_time(Clock::now()),
+          ncols_input(instance.ncols),
+          obj_is_integral(has_integer_objective(instance.costs, instance.ncols, cfg.integrality_tol)) {
+        wm.nrows = instance.nrows;
+        wm.ncols = instance.ncols;
+        wm.csr_inds = instance.csr_indices;
+        wm.csr_offs = instance.csr_offsets;
+        wm.csr_vals = instance.csr_values;
+        wm.obj = instance.costs;
+        wm.active_to_input.resize(static_cast<size_t>(instance.ncols));
+        std::iota(wm.active_to_input.begin(), wm.active_to_input.end(), 0);
+        heuristics = make_integer_heuristics(cfg.heuristic_config);
     }
 
-    ctx.rows_by_column.assign(static_cast<size_t>(ncols), std::vector<int>());
-    for (int i = 0; i < nrows; ++i) {
-        for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-            const int col = csr_inds[static_cast<size_t>(k)];
-            if (col >= 0 && col < ncols && csr_vals[static_cast<size_t>(k)] > tol)
-                ctx.rows_by_column[static_cast<size_t>(col)].push_back(i);
-        }
+    double elapsed() const {
+        return std::chrono::duration<double>(Clock::now() - start_time).count();
     }
 
-    auto rules = make_preprocess_rules(rules_config);
-    int total_removed = 0;
-    for (const auto &rule : rules) {
-        total_removed += rule->apply(ctx, tol);
-    }
-    if (total_removed <= 0) return;
+    // Objective value (in reduced space) that a solution of the current
+    // reduced model must beat to improve on the incumbent.
+    double cutoff() const { return inc.obj - fixed_cost; }
 
-    // Rebuild
-    std::vector<int> old_to_new(static_cast<size_t>(ncols));
-    std::vector<int> new_to_old;
-    std::vector<int> new_active;
-    int new_col = 0;
-    for (int j = 0; j < ncols; ++j) {
-        if (!ctx.active[static_cast<size_t>(j)]) {
-            old_to_new[static_cast<size_t>(j)] = -1;
-        } else {
-            old_to_new[static_cast<size_t>(j)] = new_col;
-            new_to_old.push_back(j);
-            new_active.push_back(active_to_input[static_cast<size_t>(j)]);
-            ++new_col;
-        }
+    // Record columns permanently fixed to 1 by preprocessing.
+    void register_fixed(double cost, const std::vector<int> &original_cols) {
+        if (original_cols.empty() && cost == 0.0) return;
+        fixed_cost += cost;
+        fixed_original_cols.insert(fixed_original_cols.end(),
+                                   original_cols.begin(), original_cols.end());
+        if (std::isfinite(global_dual_bound)) global_dual_bound -= cost;
+        if (std::isfinite(global_dual_bound_raw)) global_dual_bound_raw -= cost;
     }
 
-    std::vector<double> new_obj(static_cast<size_t>(new_col));
-    for (int j = 0; j < new_col; ++j)
-        new_obj[static_cast<size_t>(j)] = obj[static_cast<size_t>(new_to_old[static_cast<size_t>(j)])];
+    // Rebuild the LP base model from the working model.
+    void build_base() {
+        base.nrows = wm.nrows;
+        base.ncols = wm.ncols;
+        base.ncols_input = ncols_input;
+        base.nnz = static_cast<int>(wm.csr_vals.size());
+        base.csr_inds = wm.csr_inds;
+        base.csr_offs = wm.csr_offs;
+        base.csr_vals = wm.csr_vals;
+        base.obj = wm.obj;
+        base.rhs.assign(static_cast<size_t>(wm.nrows), 1.0);
+        base.active_to_original = wm.active_to_input;
+        base.base_cuts.clear();
+        base.build_transpose();
+    }
 
-    std::vector<int> new_inds;
-    std::vector<int> new_offs;
-    std::vector<double> new_vals;
-    new_offs.push_back(0);
-    for (int i = 0; i < nrows; ++i) {
-        for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-            const int c = csr_inds[static_cast<size_t>(k)];
-            if (c >= 0 && c < ncols) {
-                const int m = old_to_new[static_cast<size_t>(c)];
-                if (m >= 0) {
-                    new_inds.push_back(m);
-                    new_vals.push_back(csr_vals[static_cast<size_t>(k)]);
-                }
+    // Adopt a solution of the current base model (reduced space) if it
+    // improves on the incumbent. Returns true on improvement.
+    bool try_adopt(double reduced_obj, const std::vector<double> &reduced_sol,
+                   const std::string &source) {
+        const double total = reduced_obj + fixed_cost;
+        if (!(total < inc.obj - tol)) return false;
+
+        inc.obj = total;
+        inc.source = source;
+        inc.solution.assign(static_cast<size_t>(ncols_input), 0.0);
+        const int copy_cols = std::min(base.ncols, static_cast<int>(reduced_sol.size()));
+        for (int j = 0; j < copy_cols; ++j) {
+            if (reduced_sol[static_cast<size_t>(j)] > 0.5) {
+                const int orig = base.active_to_original[static_cast<size_t>(j)];
+                if (orig >= 0 && orig < ncols_input)
+                    inc.solution[static_cast<size_t>(orig)] = 1.0;
             }
         }
-        new_offs.push_back(static_cast<int>(new_vals.size()));
+        for (int c : fixed_original_cols) {
+            if (c >= 0 && c < ncols_input)
+                inc.solution[static_cast<size_t>(c)] = 1.0;
+        }
+        if (verbosity >= 2)
+            fprintf(stderr, "* [%8.3fs] New incumbent: %.8f (from %s)\n",
+                    elapsed(), inc.obj, source.c_str());
+        return true;
     }
 
-    if (verbosity >= 3)
-        fprintf(stderr, "  Dominance reduction: %d -> %d cols\n", ncols, new_col);
+    // Run the primal heuristics on an LP solution of the base model.
+    // Returns true if the incumbent improved.
+    bool run_heuristics(const LpSolution &sol, const BranchNodeState &node,
+                        const std::string &prefix, bool stop_at_first) {
+        bool improved = false;
+        for (const auto &h : heuristics) {
+            auto hr = h->tryBuild(sol.col_value, sol.row_dual, base, node, integ_tol);
+            if (hr.feasible && try_adopt(hr.objective, hr.solution, prefix + hr.name)) {
+                improved = true;
+                if (stop_at_first) break;
+            }
+        }
+        return improved;
+    }
+};
 
-    ncols = new_col;
-    csr_inds = std::move(new_inds);
-    csr_offs = std::move(new_offs);
-    csr_vals = std::move(new_vals);
-    obj = std::move(new_obj);
-    active_to_input = std::move(new_active);
-}
+// ======================================================================
+// Root reductions on the working model
+// ======================================================================
 
-static void apply_cost_reduction(
-    int nrows, int &ncols,
-    std::vector<int> &csr_inds, std::vector<int> &csr_offs, std::vector<double> &csr_vals,
-    std::vector<double> &obj,
-    std::vector<int> &active_to_input,
-    double incumbent_bound, double tol, int verbosity) {
-    if (!std::isfinite(incumbent_bound) || ncols <= 0) return;
+void apply_cost_reduction(SolverRun &R) {
+    WorkingModel &wm = R.wm;
+    const double cutoff = R.cutoff();
+    if (!std::isfinite(cutoff) || wm.ncols <= 0) return;
 
-    std::vector<int> old_to_new(static_cast<size_t>(ncols));
-    std::vector<int> new_to_old;
-    std::vector<int> new_active;
-    int new_col = 0;
+    std::vector<char> keep(static_cast<size_t>(wm.ncols), 1);
     int removed = 0;
-    for (int j = 0; j < ncols; ++j) {
-        if (obj[static_cast<size_t>(j)] + tol >= incumbent_bound) {
-            old_to_new[static_cast<size_t>(j)] = -1;
+    for (int j = 0; j < wm.ncols; ++j) {
+        if (wm.obj[static_cast<size_t>(j)] + R.tol >= cutoff) {
+            keep[static_cast<size_t>(j)] = 0;
             ++removed;
-        } else {
-            old_to_new[static_cast<size_t>(j)] = new_col;
-            new_to_old.push_back(j);
-            new_active.push_back(active_to_input[static_cast<size_t>(j)]);
-            ++new_col;
         }
     }
     if (removed == 0) return;
-
-    std::vector<double> new_obj(static_cast<size_t>(new_col));
-    for (int j = 0; j < new_col; ++j)
-        new_obj[static_cast<size_t>(j)] = obj[static_cast<size_t>(new_to_old[static_cast<size_t>(j)])];
-
-    std::vector<int> new_inds;
-    std::vector<int> new_offs;
-    std::vector<double> new_vals;
-    new_offs.push_back(0);
-    for (int i = 0; i < nrows; ++i) {
-        for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-            const int c = csr_inds[static_cast<size_t>(k)];
-            if (c >= 0 && c < ncols) {
-                const int m = old_to_new[static_cast<size_t>(c)];
-                if (m >= 0) {
-                    new_inds.push_back(m);
-                    new_vals.push_back(csr_vals[static_cast<size_t>(k)]);
-                }
-            }
-        }
-        new_offs.push_back(static_cast<int>(new_vals.size()));
-    }
-
-    if (verbosity >= 3)
-        fprintf(stderr, "  Cost reduction: %d cols removed, %d remaining\n", removed, new_col);
-
-    ncols = new_col;
-    csr_inds = std::move(new_inds);
-    csr_offs = std::move(new_offs);
-    csr_vals = std::move(new_vals);
-    obj = std::move(new_obj);
-    active_to_input = std::move(new_active);
+    wm.remove_columns(keep);
+    if (R.verbosity >= 3)
+        fprintf(stderr, "  Cost reduction: %d cols removed, %d remaining\n", removed, wm.ncols);
 }
 
-static void apply_budget_pruning_preprocess(
-    int nrows, int &ncols,
-    std::vector<int> &csr_inds, std::vector<int> &csr_offs, std::vector<double> &csr_vals,
-    std::vector<double> &obj,
-    std::vector<int> &active_to_input,
-    double incumbent_bound, double tol, double time_limit, int verbosity) {
-    if (!std::isfinite(incumbent_bound) || ncols <= 0) return;
+void apply_budget_pruning(SolverRun &R) {
+    WorkingModel &wm = R.wm;
+    const double cutoff = R.cutoff();
+    if (!std::isfinite(cutoff) || wm.ncols <= 0) return;
 
-    ColumnPreprocessContext ctx;
-    ctx.nrows = nrows;
-    ctx.ncols = ncols;
-    ctx.costs.assign(obj.begin(), obj.begin() + ncols);
-    ctx.active.assign(static_cast<size_t>(ncols), 1);
-    ctx.incumbent_bound = incumbent_bound;
-    if (time_limit > 0.0) {
-        ctx.deadline = std::chrono::steady_clock::now() +
-                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                           std::chrono::duration<double>(time_limit));
-    }
-
-    ctx.rows_by_column.assign(static_cast<size_t>(ncols), std::vector<int>());
-    for (int i = 0; i < nrows; ++i) {
-        for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-            const int col = csr_inds[static_cast<size_t>(k)];
-            if (col >= 0 && col < ncols && csr_vals[static_cast<size_t>(k)] > tol)
-                ctx.rows_by_column[static_cast<size_t>(col)].push_back(i);
-        }
-    }
-
+    ColumnPreprocessContext ctx = make_column_context(
+        wm.nrows, wm.ncols, wm.csr_inds, wm.csr_offs, wm.csr_vals, wm.obj,
+        R.tol, R.config.preprocess_time_limit, cutoff);
     auto rules = make_preprocess_rules("incumbent_budget");
     int total_removed = 0;
-    for (const auto &rule : rules) total_removed += rule->apply(ctx, tol);
+    for (const auto &rule : rules) total_removed += rule->apply(ctx, R.tol);
     if (total_removed <= 0) return;
 
-    std::vector<int> old_to_new(static_cast<size_t>(ncols));
-    std::vector<int> new_to_old;
-    std::vector<int> new_active;
-    int new_col = 0;
-    for (int j = 0; j < ncols; ++j) {
-        if (!ctx.active[static_cast<size_t>(j)]) {
-            old_to_new[static_cast<size_t>(j)] = -1;
-        } else {
-            old_to_new[static_cast<size_t>(j)] = new_col;
-            new_to_old.push_back(j);
-            new_active.push_back(active_to_input[static_cast<size_t>(j)]);
-            ++new_col;
-        }
-    }
-
-    std::vector<double> new_obj(static_cast<size_t>(new_col));
-    for (int j = 0; j < new_col; ++j)
-        new_obj[static_cast<size_t>(j)] = obj[static_cast<size_t>(new_to_old[static_cast<size_t>(j)])];
-
-    std::vector<int> new_inds, new_offs;
-    std::vector<double> new_vals;
-    new_offs.push_back(0);
-    for (int i = 0; i < nrows; ++i) {
-        for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-            const int c = csr_inds[static_cast<size_t>(k)];
-            if (c >= 0 && c < ncols) {
-                const int m = old_to_new[static_cast<size_t>(c)];
-                if (m >= 0) {
-                    new_inds.push_back(m);
-                    new_vals.push_back(csr_vals[static_cast<size_t>(k)]);
-                }
-            }
-        }
-        new_offs.push_back(static_cast<int>(new_vals.size()));
-    }
-
-    if (verbosity >= 3)
-        fprintf(stderr, "  Budget pruning: %d cols removed, %d remaining\n", total_removed, new_col);
-
-    ncols = new_col;
-    csr_inds = std::move(new_inds);
-    csr_offs = std::move(new_offs);
-    csr_vals = std::move(new_vals);
-    obj = std::move(new_obj);
-    active_to_input = std::move(new_active);
+    wm.remove_columns(ctx.active);
+    if (R.verbosity >= 3)
+        fprintf(stderr, "  Budget pruning: %d cols removed, %d remaining\n", total_removed, wm.ncols);
 }
 
-SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
-    using Clock = std::chrono::steady_clock;
-    const auto start_time = Clock::now();
+void apply_dominance_reduction(SolverRun &R, const std::string &rules_config) {
+    WorkingModel &wm = R.wm;
+    if (wm.ncols <= 0) return;
 
+    ColumnPreprocessContext ctx = make_column_context(
+        wm.nrows, wm.ncols, wm.csr_inds, wm.csr_offs, wm.csr_vals, wm.obj,
+        R.tol, R.config.preprocess_time_limit, kInf);
+    auto rules = make_preprocess_rules(rules_config);
+    int total_removed = 0;
+    for (const auto &rule : rules) total_removed += rule->apply(ctx, R.tol);
+    if (total_removed <= 0) return;
+
+    const int before = wm.ncols;
+    wm.remove_columns(ctx.active);
+    if (R.verbosity >= 3)
+        fprintf(stderr, "  Dominance reduction: %d -> %d cols\n", before, wm.ncols);
+}
+
+void apply_dominance_finder(SolverRun &R) {
+    WorkingModel &wm = R.wm;
+    if (wm.ncols <= 0 || wm.nrows <= 0) return;
+
+    ColumnPreprocessContext ctx = make_column_context(
+        wm.nrows, wm.ncols, wm.csr_inds, wm.csr_offs, wm.csr_vals, wm.obj,
+        R.tol, R.config.preprocess_time_limit, kInf);
+    const int removed = dominance_finder(ctx, R.tol, 0.5, R.verbosity);
+    if (removed <= 0) return;
+
+    wm.remove_columns(ctx.active);
+    if (R.verbosity >= 2)
+        fprintf(stderr, "  Dominance Finder: %d cols removed, %d remaining\n", removed, wm.ncols);
+}
+
+// Essential-column fixing, row domination and probing. Returns true if the
+// model changed.
+bool apply_row_reduction(SolverRun &R) {
+    WorkingModel &wm = R.wm;
+    auto rr = row_reduce(wm.nrows, wm.ncols, wm.csr_inds, wm.csr_offs, wm.csr_vals,
+                         wm.obj, wm.active_to_input,
+                         R.tol, R.config.preprocess_time_limit, R.verbosity);
+    const bool changed = (rr.cols_fixed > 0 || rr.rows_removed > 0);
+    if (changed) R.register_fixed(rr.fixed_cost, rr.fixed_original_cols);
+    return changed;
+}
+
+// Re-run the cheap reductions until nothing changes (bounded number of rounds).
+void iterate_reductions(SolverRun &R, const char *tag) {
+    const int max_extra_rounds = 9;
+    for (int round = 0; round < max_extra_rounds; ++round) {
+        const int ncols_start = R.wm.ncols;
+        const int nrows_start = R.wm.nrows;
+        apply_cost_reduction(R);
+        apply_dominance_reduction(R, R.config.preprocess_rules);
+        apply_row_reduction(R);
+        if (R.wm.ncols == ncols_start && R.wm.nrows == nrows_start) break;
+        if (R.verbosity >= 3)
+            fprintf(stderr, "  %s round %d: %d/%d -> %d/%d (cols/rows)\n",
+                    tag, round + 2, ncols_start, nrows_start, R.wm.ncols, R.wm.nrows);
+    }
+}
+
+// ======================================================================
+// Phase 1: greedy heuristic
+// ======================================================================
+void run_greedy(SolverRun &R) {
+    if (R.verbosity >= 2) fprintf(stderr, "Phase 1: Greedy set cover heuristic\n");
+    const WorkingModel &wm = R.wm;
+    auto greedy = greedy_set_cover_heuristic(wm.nrows, wm.ncols, wm.csr_inds, wm.csr_offs,
+                                             wm.csr_vals, wm.obj.data());
+    if (!greedy.feasible) return;
+
+    R.inc.obj = greedy.objective;
+    R.inc.source = "greedy";
+    R.inc.solution.assign(static_cast<size_t>(R.ncols_input), 0.0);
+    for (int col : greedy.selected_columns) {
+        const int input_col = wm.active_to_input[static_cast<size_t>(col)];
+        if (input_col >= 0 && input_col < R.ncols_input)
+            R.inc.solution[static_cast<size_t>(input_col)] = 1.0;
+    }
+    if (R.verbosity >= 2)
+        fprintf(stderr, "  Greedy incumbent: %.12g\n", R.inc.obj);
+}
+
+// ======================================================================
+// Phase 2: cost + budget + dominance + row reduction (iterated)
+// ======================================================================
+void run_root_reductions(SolverRun &R) {
+    const int cols_before = R.wm.ncols;
+
+    // Step 1: cheap reductions (cost + budget)
+    apply_cost_reduction(R);
+    apply_budget_pruning(R);
+
+    // Step 2: greedy multi-column dominance (fast, removes bulk of dominated cols)
+    apply_dominance_finder(R);
+
+    // Step 3: exact pairwise/triplet dominance on the reduced set
+    apply_dominance_reduction(R, "cost_driven");
+    apply_dominance_reduction(R, R.config.preprocess_rules);
+
+    // Step 4: row reduction (essential columns, row domination, probing)
+    if (apply_row_reduction(R))
+        iterate_reductions(R, "Preprocess");
+
+    if (R.wm.ncols < cols_before && R.verbosity >= 2)
+        fprintf(stderr, "  Pre-LP reduction: cols %d -> %d, rows %d\n",
+                cols_before, R.wm.ncols, R.wm.nrows);
+}
+
+// Result when preprocessing alone covered every row with essential columns.
+SolverResult trivial_result(const SolverRun &R) {
     SolverResult result;
-    const int verbosity = config.verbosity;
-    const double tol = config.feasibility_tol;
-    const double integ_tol = config.integrality_tol;
-
-    // Working copies for preprocessing
-    int nrows = instance.nrows;
-    int ncols = instance.ncols;
-    const int ncols_input = ncols;
-    std::vector<int> csr_inds = instance.csr_indices;
-    std::vector<int> csr_offs = instance.csr_offsets;
-    std::vector<double> csr_vals = instance.csr_values;
-    std::vector<double> obj = instance.costs;
-    std::vector<int> active_to_input(static_cast<size_t>(ncols));
-    for (int j = 0; j < ncols; ++j) active_to_input[static_cast<size_t>(j)] = j;
-
-    const bool obj_is_integral = has_integer_objective(obj, ncols, integ_tol);
-    if (obj_is_integral && verbosity >= 2)
-        fprintf(stderr, "Objective coefficients are integral; enabling dual bound tightening\n");
-
-    double best_obj = std::numeric_limits<double>::infinity();
-    std::vector<double> best_solution;
-    std::string incumbent_source = "none";
-    double global_dual_bound = -std::numeric_limits<double>::infinity();
-    double global_dual_bound_raw = -std::numeric_limits<double>::infinity();
-    double fixed_preprocess_cost = 0.0;
-    std::vector<int> fixed_original_cols;
-
-    auto heuristics = make_integer_heuristics(config.heuristic_config);
-
-    // ================================================================
-    // Phase 1: Greedy heuristic
-    // ================================================================
-    if (verbosity >= 2) fprintf(stderr, "Phase 1: Greedy set cover heuristic\n");
-    {
-        auto greedy = greedy_set_cover_heuristic(nrows, ncols, csr_inds, csr_offs, csr_vals, obj.data());
-        if (greedy.feasible) {
-            best_obj = greedy.objective;
-            best_solution.assign(static_cast<size_t>(ncols_input), 0.0);
-            for (int col : greedy.selected_columns) {
-                int input_col = active_to_input[static_cast<size_t>(col)];
-                if (input_col >= 0 && input_col < ncols_input)
-                    best_solution[static_cast<size_t>(input_col)] = 1.0;
-            }
-            incumbent_source = "greedy";
-            if (verbosity >= 2)
-                fprintf(stderr, "  Greedy incumbent: %.12g\n", best_obj);
-        }
+    result.wall_time = R.elapsed();
+    result.primal_obj = R.fixed_cost;
+    result.dual_obj = R.fixed_cost;
+    result.mip_gap = 0.0;
+    result.nodes_processed = 0;
+    result.lp_solves = 0;
+    result.status = "Optimal";
+    result.solution.assign(static_cast<size_t>(R.ncols_input), 0.0);
+    for (int c : R.fixed_original_cols) {
+        if (c >= 0 && c < R.ncols_input)
+            result.solution[static_cast<size_t>(c)] = 1.0;
     }
+    if (R.verbosity >= 1)
+        fprintf(stderr, "All rows covered by essential columns (cost %.12g)\n", R.fixed_cost);
+    return result;
+}
 
-    // ================================================================
-    // Phase 2: Cost + budget + dominance + row reduction (iterated)
-    // ================================================================
-    // Helper: run Dominance Finder with CSR compaction
-    auto run_dominance_finder = [&]() {
-        if (ncols <= 0 || nrows <= 0) return;
-        ColumnPreprocessContext df_ctx;
-        df_ctx.nrows = nrows;
-        df_ctx.ncols = ncols;
-        df_ctx.costs.resize(static_cast<size_t>(ncols));
-        df_ctx.active.assign(static_cast<size_t>(ncols), 1);
-        df_ctx.rows_by_column.resize(static_cast<size_t>(ncols));
-        df_ctx.deadline = std::chrono::steady_clock::now() +
-            std::chrono::seconds(static_cast<int>(config.preprocess_time_limit));
+// ======================================================================
+// Phase 3: root LP relaxation and Lagrangian heuristic
+// ======================================================================
+void solve_root_lp(SolverRun &R) {
+    if (R.verbosity >= 2) fprintf(stderr, "Phase 3: Root LP relaxation\n");
 
-        for (int j = 0; j < ncols; ++j)
-            df_ctx.costs[static_cast<size_t>(j)] = obj[static_cast<size_t>(j)];
-        for (int i = 0; i < nrows; ++i) {
-            for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                const int col = csr_inds[static_cast<size_t>(k)];
-                if (col >= 0 && col < ncols)
-                    df_ctx.rows_by_column[static_cast<size_t>(col)].push_back(i);
-            }
-        }
-
-        int df_removed = dominance_finder(df_ctx, tol, 0.5, verbosity);
-        if (df_removed > 0) {
-            std::vector<int> old_to_new(static_cast<size_t>(ncols), -1);
-            int new_idx = 0;
-            for (int j = 0; j < ncols; ++j) {
-                if (df_ctx.active[static_cast<size_t>(j)])
-                    old_to_new[static_cast<size_t>(j)] = new_idx++;
-            }
-            std::vector<double> new_obj;
-            std::vector<int> new_active;
-            for (int j = 0; j < ncols; ++j) {
-                if (df_ctx.active[static_cast<size_t>(j)]) {
-                    new_obj.push_back(obj[static_cast<size_t>(j)]);
-                    new_active.push_back(active_to_input[static_cast<size_t>(j)]);
-                }
-            }
-            std::vector<int> new_inds;
-            std::vector<int> new_offs = {0};
-            std::vector<double> new_vals;
-            for (int i = 0; i < nrows; ++i) {
-                for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                    const int old_col = csr_inds[static_cast<size_t>(k)];
-                    if (old_col >= 0 && old_col < ncols && old_to_new[static_cast<size_t>(old_col)] >= 0) {
-                        new_inds.push_back(old_to_new[static_cast<size_t>(old_col)]);
-                        new_vals.push_back(csr_vals[static_cast<size_t>(k)]);
-                    }
-                }
-                new_offs.push_back(static_cast<int>(new_inds.size()));
-            }
-            ncols = new_idx;
-            obj = std::move(new_obj);
-            active_to_input = std::move(new_active);
-            csr_inds = std::move(new_inds);
-            csr_offs = std::move(new_offs);
-            csr_vals = std::move(new_vals);
-            if (verbosity >= 2)
-                fprintf(stderr, "  Dominance Finder: %d cols removed, %d remaining\n", df_removed, ncols);
-        }
-    };
-
-    {
-        const int cols_before = ncols;
-        // Step 1: Cheap reductions (cost + budget)
-        apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                             best_obj, tol, verbosity);
-        apply_budget_pruning_preprocess(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                        best_obj, tol, config.preprocess_time_limit, verbosity);
-
-        // Step 2: Greedy multi-column dominance (fast, removes bulk of dominated cols)
-        run_dominance_finder();
-
-        // Step 3: Exact pairwise/triplet dominance on reduced set
-        apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                  "cost_driven", tol, config.preprocess_time_limit, verbosity);
-        apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                  config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
-
-        // Step 4: Row reduction (essential columns, row domination, probing)
-        auto rr = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                             tol, config.preprocess_time_limit, verbosity);
-        if (rr.cols_fixed > 0 || rr.rows_removed > 0) {
-            fixed_preprocess_cost += rr.fixed_cost;
-            for (int c : rr.fixed_original_cols) fixed_original_cols.push_back(c);
-            best_obj -= rr.fixed_cost;
-        }
-        // Iterate if row reduction changed the model
-        if (rr.cols_fixed > 0 || rr.rows_removed > 0) {
-            const int max_extra_rounds = 9;
-            for (int round = 0; round < max_extra_rounds; ++round) {
-                const int ncols_start = ncols;
-                const int nrows_start = nrows;
-                apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                     best_obj, tol, verbosity);
-                apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                          config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
-                auto rr2 = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                      tol, config.preprocess_time_limit, verbosity);
-                if (rr2.cols_fixed > 0 || rr2.rows_removed > 0) {
-                    fixed_preprocess_cost += rr2.fixed_cost;
-                    for (int c : rr2.fixed_original_cols) fixed_original_cols.push_back(c);
-                    best_obj -= rr2.fixed_cost;
-                }
-                if (ncols == ncols_start && nrows == nrows_start) break;
-                if (verbosity >= 3)
-                    fprintf(stderr, "  Preprocess round %d: %d/%d -> %d/%d (cols/rows)\n",
-                            round + 2, ncols_start, nrows_start, ncols, nrows);
-            }
-        }
-        if (ncols < cols_before && verbosity >= 2)
-            fprintf(stderr, "  Pre-LP reduction: cols %d -> %d, rows %d\n", cols_before, ncols, nrows);
-    }
-
-    // Check if all rows are covered by essential columns
-    if (nrows == 0) {
-        const auto end_time = Clock::now();
-        result.wall_time = std::chrono::duration<double>(end_time - start_time).count();
-        result.primal_obj = fixed_preprocess_cost;
-        result.dual_obj = fixed_preprocess_cost;
-        result.mip_gap = 0.0;
-        result.nodes_processed = 0;
-        result.lp_solves = 0;
-        result.status = "Optimal";
-        result.solution.assign(static_cast<size_t>(ncols_input), 0.0);
-        for (int c : fixed_original_cols) {
-            if (c >= 0 && c < ncols_input)
-                result.solution[static_cast<size_t>(c)] = 1.0;
-        }
-        if (verbosity >= 1)
-            fprintf(stderr, "All rows covered by essential columns (cost %.12g)\n",
-                    fixed_preprocess_cost);
-        return result;
-    }
-
-    // ================================================================
-    // Phase 3: Root LP solve
-    // ================================================================
-    if (verbosity >= 2) fprintf(stderr, "Phase 3: Root LP relaxation\n");
-
-    BaseRelaxationModel base;
-    auto build_base = [&]() {
-        base.nrows = nrows;
-        base.ncols = ncols;
-        base.ncols_input = ncols_input;
-        base.nnz = static_cast<int>(csr_vals.size());
-        base.csr_inds = csr_inds;
-        base.csr_offs = csr_offs;
-        base.csr_vals = csr_vals;
-        base.obj = obj;
-        base.rhs.assign(static_cast<size_t>(nrows), 1.0);
-        base.active_to_original = active_to_input;
-        base.base_cuts.clear();
-        base.build_transpose();
-    };
-    build_base();
-
-    LpSolver lp;
-    lp.build_model(base);
-    int total_lp_solves = 0;
+    R.build_base();
+    R.lp.build_model(R.base);
 
     // Root LP: use IPM for large models, simplex otherwise
-    bool use_ipm_root = (config.root_lp_solver == "ipm") ||
-        (config.root_lp_solver == "auto" && base.ncols >= 500 && base.nrows >= 200);
-    LpSolution root_sol;
+    const bool use_ipm_root = (R.config.root_lp_solver == "ipm") ||
+        (R.config.root_lp_solver == "auto" && R.base.ncols >= 500 && R.base.nrows >= 200);
     if (use_ipm_root) {
-        if (verbosity >= 2)
+        if (R.verbosity >= 2)
             fprintf(stderr, "  Root LP solver: IPM (barrier) with crossover\n");
-        root_sol = lp.solve_ipm();
+        R.root_sol = R.lp.solve_ipm();
     } else {
-        root_sol = lp.solve();
+        R.root_sol = R.lp.solve();
     }
-    ++total_lp_solves;
+    ++R.total_lp_solves;
 
-    if (root_sol.solved && root_sol.optimal) {
-        lp.save_basis();
-
-        // Try heuristics on root LP
-        BranchNodeState root_node;
-        for (const auto &h : heuristics) {
-            auto hr = h->tryBuild(root_sol.col_value, root_sol.row_dual, base, root_node, integ_tol);
-            if (hr.feasible && hr.objective < best_obj - tol) {
-                best_obj = hr.objective;
-                adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
-                incumbent_source = std::string("root_") + hr.name;
-            }
-        }
-
-        // Check if root LP is integral
-        if (static_cast<int>(root_sol.col_value.size()) >= base.ncols &&
-            is_binary_integral(root_sol.col_value, base.ncols, integ_tol) &&
-            root_sol.primal_obj < best_obj - tol) {
-            best_obj = root_sol.primal_obj;
-            adopt_incumbent_solution(best_solution, root_sol.col_value, base.ncols, ncols_input, base.active_to_original);
-            incumbent_source = "root_lp_exact";
-        }
-
-        double root_dual = root_sol.dual_obj;
-        global_dual_bound_raw = root_dual;
-        if (obj_is_integral)
-            root_dual = tighten_dual_bound(root_dual, integ_tol);
-        global_dual_bound = root_dual;
-
-        if (verbosity >= 2)
-            fprintf(stderr, "  Root LP: primal=%.12g dual=%.12g\n",
-                    root_sol.primal_obj, root_sol.dual_obj);
-    } else {
-        if (verbosity >= 1)
+    if (!R.root_sol.solved || !R.root_sol.optimal) {
+        if (R.verbosity >= 1)
             fprintf(stderr, "  Root LP did not converge\n");
+        return;
+    }
+    R.lp.save_basis();
+
+    // Heuristics on the root LP
+    BranchNodeState root_node;
+    R.run_heuristics(R.root_sol, root_node, "root_", false);
+
+    // Integral root LP
+    if (static_cast<int>(R.root_sol.col_value.size()) >= R.base.ncols &&
+        is_binary_integral(R.root_sol.col_value, R.base.ncols, R.integ_tol))
+        R.try_adopt(R.root_sol.primal_obj, R.root_sol.col_value, "root_lp_exact");
+
+    double root_dual = R.root_sol.dual_obj;
+    R.global_dual_bound_raw = root_dual;
+    if (R.obj_is_integral)
+        root_dual = tighten_dual_bound(root_dual, R.integ_tol);
+    R.global_dual_bound = root_dual;
+
+    if (R.verbosity >= 2)
+        fprintf(stderr, "  Root LP: primal=%.12g dual=%.12g\n",
+                R.root_sol.primal_obj, R.root_sol.dual_obj);
+
+    // Phase 3.5: Lagrangian relaxation (subgradient optimization) as a heuristic
+    const int lagr_max_iters = 500;
+    const double lagr_time_limit = 5.0;
+    auto lagr = lagrangian_relaxation(R.base, R.cutoff(), R.root_sol.row_dual,
+                                      lagr_max_iters, lagr_time_limit, R.verbosity);
+    if (!lagr.best_solution.empty())
+        R.try_adopt(lagr.best_heuristic_obj, lagr.best_solution, "lagrangian");
+}
+
+// ======================================================================
+// Phase 4: iterative reduced-cost fixing (fix-resolve-fix cycles)
+// ======================================================================
+void run_rc_fixing(SolverRun &R) {
+    if (!R.root_sol.solved || !R.root_sol.optimal || !std::isfinite(R.cutoff())) return;
+
+    WorkingModel &wm = R.wm;
+    const int max_rc_iters = 10;
+    int total_rc_removed = 0;
+    for (int rc_iter = 0; rc_iter < max_rc_iters; ++rc_iter) {
+        const double gap = R.cutoff() - R.root_sol.dual_obj;
+        if (gap <= R.tol) break;
+
+        const int n = std::min(wm.ncols, static_cast<int>(R.root_sol.col_value.size()));
+        auto rcosts = compute_reduced_costs(wm.obj, R.root_sol.row_dual, R.base, n);
+        std::vector<char> keep(static_cast<size_t>(wm.ncols), 1);
+        int rc_removed = 0;
+        for (int j = 0; j < n; ++j) {
+            if (R.root_sol.col_value[static_cast<size_t>(j)] < R.tol &&
+                rcosts[static_cast<size_t>(j)] > gap + R.tol) {
+                keep[static_cast<size_t>(j)] = 0;
+                ++rc_removed;
+            }
+        }
+        if (rc_removed == 0) break;
+
+        wm.remove_columns(keep);
+        total_rc_removed += rc_removed;
+        if (R.verbosity >= 3)
+            fprintf(stderr, "  RC fixing iter %d: %d cols removed, %d remaining\n",
+                    rc_iter + 1, rc_removed, wm.ncols);
+
+        // Rebuild base model and re-solve LP
+        R.build_base();
+        R.lp.rebuild_model(R.base);
+        R.root_sol = R.lp.solve();
+        ++R.total_lp_solves;
+        if (!R.root_sol.solved || !R.root_sol.optimal) break;
+        R.lp.save_basis();
+
+        // Heuristics on the tighter LP (may improve the incumbent and the gap)
+        BranchNodeState rc_node;
+        R.run_heuristics(R.root_sol, rc_node, "rcfix_", false);
+    }
+    if (total_rc_removed > 0 && R.verbosity >= 2)
+        fprintf(stderr, "  Iterative RC fixing: %d cols removed total\n", total_rc_removed);
+}
+
+// ======================================================================
+// Phase 5: LP-based probing (fix x_j = 1 when x_j = 0 cannot improve)
+// ======================================================================
+void run_lp_probing(SolverRun &R) {
+    if (!R.root_sol.solved || !R.root_sol.optimal || !std::isfinite(R.cutoff()) ||
+        R.wm.ncols > 800)
+        return;
+
+    WorkingModel &wm = R.wm;
+    const auto probe_start = Clock::now();
+    const double probe_time_limit = 10.0;
+
+    // Only probe columns with x_j > 0 in the LP (forcing a zero to 0 is a no-op),
+    // most impactful first.
+    std::vector<int> probe_order;
+    for (int j = 0; j < wm.ncols; ++j) {
+        if (R.root_sol.col_value[static_cast<size_t>(j)] > R.tol)
+            probe_order.push_back(j);
+    }
+    std::sort(probe_order.begin(), probe_order.end(), [&](int a, int b) {
+        return R.root_sol.col_value[static_cast<size_t>(a)] >
+               R.root_sol.col_value[static_cast<size_t>(b)];
+    });
+
+    std::vector<char> probe_fix_one(static_cast<size_t>(wm.ncols), 0);
+    int probe_fixed = 0;
+    HighsBasis probe_basis = R.lp.get_basis();
+
+    for (int j : probe_order) {
+        const double elapsed = std::chrono::duration<double>(Clock::now() - probe_start).count();
+        if (elapsed > probe_time_limit) break;
+
+        R.lp.restore_base_state();
+        R.lp.set_basis(probe_basis);
+        BranchDecision fix_zero{j, 0};
+        R.lp.apply_decisions({fix_zero});
+        auto probe_sol = R.lp.solve();
+        ++R.total_lp_solves;
+
+        // Only a proven result may fix a column: an LP that failed to solve
+        // says nothing about x_j = 0.
+        if (probe_sol.infeasible ||
+            (probe_sol.optimal && probe_sol.primal_obj > R.cutoff() + R.tol)) {
+            probe_fix_one[static_cast<size_t>(j)] = 1;
+            ++probe_fixed;
+        }
     }
 
-    // ================================================================
-    // Phase 3.5: Lagrangian relaxation (subgradient optimization)
-    // ================================================================
-    if (root_sol.solved && root_sol.optimal) {
-        const int lagr_max_iters = 500;
-        const double lagr_time_limit = 5.0;
-        auto lagr = lagrangian_relaxation(base, best_obj, root_sol.row_dual,
-                                          lagr_max_iters, lagr_time_limit, verbosity);
+    // Restore LP state
+    R.lp.restore_base_state();
+    R.lp.set_basis(probe_basis);
 
-        if (lagr.best_heuristic_obj < best_obj - tol &&
-            !lagr.best_solution.empty()) {
-            best_obj = lagr.best_heuristic_obj;
-            adopt_incumbent_solution(best_solution, lagr.best_solution,
-                                     base.ncols, ncols_input, base.active_to_original);
-            incumbent_source = "lagrangian";
+    if (probe_fixed == 0) return;
+    if (R.verbosity >= 2)
+        fprintf(stderr, "  LP probing: %d cols fixed to 1\n", probe_fixed);
+
+    double probe_fixed_cost = 0.0;
+    std::vector<int> probe_fixed_cols;
+    std::vector<char> keep_row(static_cast<size_t>(wm.nrows), 1);
+    std::vector<char> keep_col(static_cast<size_t>(wm.ncols), 1);
+    for (int j = 0; j < wm.ncols; ++j) {
+        if (!probe_fix_one[static_cast<size_t>(j)]) continue;
+        keep_col[static_cast<size_t>(j)] = 0;
+        probe_fixed_cost += wm.obj[static_cast<size_t>(j)];
+        probe_fixed_cols.push_back(wm.active_to_input[static_cast<size_t>(j)]);
+        for (const auto &entry : R.base.cols_to_rows[static_cast<size_t>(j)]) {
+            if (entry.row >= 0 && entry.row < wm.nrows && entry.val > 0.0)
+                keep_row[static_cast<size_t>(entry.row)] = 0;
         }
     }
 
-    // ================================================================
-    // Phase 4-5: Post-LP reduction
-    // ================================================================
-    {
-        const int cols_before = ncols;
-        // Update working arrays from base
-        csr_inds = base.csr_inds; csr_offs = base.csr_offs; csr_vals = base.csr_vals;
-        obj = base.obj; active_to_input = base.active_to_original;
-        ncols = base.ncols;
+    // Drop the fixed columns and the rows they cover
+    wm.remove_columns(keep_col);
+    wm.remove_rows(keep_row);
+    R.register_fixed(probe_fixed_cost, probe_fixed_cols);
 
-        // Iterative reduced-cost fixing: fix-resolve-fix cycles
-        if (root_sol.solved && root_sol.optimal && std::isfinite(best_obj)) {
-            const int max_rc_iters = 10;
-            int total_rc_removed = 0;
-            for (int rc_iter = 0; rc_iter < max_rc_iters; ++rc_iter) {
-                const double gap = best_obj - root_sol.dual_obj;
-                if (gap <= tol) break;
+    // Rebuild and re-solve for heuristics on the reduced model
+    R.build_base();
+    R.lp.rebuild_model(R.base);
+    R.root_sol = R.lp.solve();
+    ++R.total_lp_solves;
+    if (R.root_sol.solved && R.root_sol.optimal) {
+        R.lp.save_basis();
+        BranchNodeState probe_node;
+        R.run_heuristics(R.root_sol, probe_node, "probe_", false);
+    }
+}
 
-                auto rcosts = compute_reduced_costs(obj, root_sol.row_dual,
-                    base, std::min(ncols, static_cast<int>(root_sol.col_value.size())));
-                int rc_removed = 0;
-                std::vector<char> rc_active(static_cast<size_t>(ncols), 1);
-                for (int j = 0; j < ncols && j < static_cast<int>(rcosts.size()); ++j) {
-                    if (root_sol.col_value[static_cast<size_t>(j)] < tol &&
-                        rcosts[static_cast<size_t>(j)] > gap + tol) {
-                        rc_active[static_cast<size_t>(j)] = 0;
-                        ++rc_removed;
-                    }
-                }
-                if (rc_removed == 0) break;
+// ======================================================================
+// Phases 4-5: everything between the root LP and the BnB base model
+// ======================================================================
+void run_post_lp_phase(SolverRun &R) {
+    const int cols_before = R.wm.ncols;
 
-                // Rebuild without fixed columns
-                std::vector<int> old_to_new(static_cast<size_t>(ncols), -1);
-                std::vector<int> new_active_input;
-                std::vector<double> new_obj_rc;
-                int nc = 0;
-                for (int j = 0; j < ncols; ++j) {
-                    if (rc_active[static_cast<size_t>(j)]) {
-                        old_to_new[static_cast<size_t>(j)] = nc;
-                        new_active_input.push_back(active_to_input[static_cast<size_t>(j)]);
-                        new_obj_rc.push_back(obj[static_cast<size_t>(j)]);
-                        ++nc;
-                    }
-                }
-                std::vector<int> new_inds_rc;
-                std::vector<int> new_offs_rc;
-                std::vector<double> new_vals_rc;
-                new_offs_rc.push_back(0);
-                for (int i = 0; i < nrows; ++i) {
-                    for (int k = csr_offs[static_cast<size_t>(i)];
-                         k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                        const int c = csr_inds[static_cast<size_t>(k)];
-                        if (c >= 0 && c < ncols) {
-                            const int m = old_to_new[static_cast<size_t>(c)];
-                            if (m >= 0) {
-                                new_inds_rc.push_back(m);
-                                new_vals_rc.push_back(csr_vals[static_cast<size_t>(k)]);
-                            }
-                        }
-                    }
-                    new_offs_rc.push_back(static_cast<int>(new_vals_rc.size()));
-                }
-                if (verbosity >= 3)
-                    fprintf(stderr, "  RC fixing iter %d: %d cols removed, %d remaining\n",
-                            rc_iter + 1, rc_removed, nc);
-                ncols = nc;
-                csr_inds = std::move(new_inds_rc);
-                csr_offs = std::move(new_offs_rc);
-                csr_vals = std::move(new_vals_rc);
-                obj = std::move(new_obj_rc);
-                active_to_input = std::move(new_active_input);
-                total_rc_removed += rc_removed;
+    run_rc_fixing(R);
+    run_lp_probing(R);
 
-                // Rebuild base model and re-solve LP
-                build_base();
-                lp.rebuild_model(base);
-                root_sol = lp.solve();
-                ++total_lp_solves;
-                if (!root_sol.solved || !root_sol.optimal) break;
-                lp.save_basis();
+    // Post-LP reductions with the (possibly improved) incumbent
+    apply_cost_reduction(R);
+    apply_budget_pruning(R);
+    apply_dominance_reduction(R, R.config.preprocess_rules);
+    if (apply_row_reduction(R))
+        iterate_reductions(R, "Post-LP");
 
-                // Run heuristics on tighter LP (may improve incumbent → smaller gap)
-                BranchNodeState rc_node;
-                for (const auto &h : heuristics) {
-                    auto hr = h->tryBuild(root_sol.col_value, root_sol.row_dual, base, rc_node, integ_tol);
-                    if (hr.feasible && hr.objective < best_obj - tol) {
-                        best_obj = hr.objective;
-                        adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
-                        incumbent_source = std::string("rcfix_") + hr.name;
-                    }
-                }
+    if (R.wm.ncols < cols_before && R.verbosity >= 2)
+        fprintf(stderr, "  Post-LP reduction: cols %d -> %d, rows %d\n",
+                cols_before, R.wm.ncols, R.wm.nrows);
+}
 
-                // Update working arrays from base for next iteration
-                csr_inds = base.csr_inds; csr_offs = base.csr_offs; csr_vals = base.csr_vals;
-                obj = base.obj; active_to_input = base.active_to_original;
-                ncols = base.ncols;
-            }
-            if (total_rc_removed > 0 && verbosity >= 2)
-                fprintf(stderr, "  Iterative RC fixing: %d cols removed total\n", total_rc_removed);
+// ======================================================================
+// Phase 6: BnB base model, root cuts, root Balas cuts, post-cut pruning
+// ======================================================================
+void run_root_cut_rounds(SolverRun &R) {
+    if (!R.config.cuts_enabled || R.config.cut_rounds_root <= 0 ||
+        !R.root_sol.solved || !R.root_sol.optimal)
+        return;
+
+    BaseRelaxationModel &base = R.base;
+    auto separators = make_cut_separators();
+    LpSolution cut_sol = R.root_sol;
+    int root_cuts_added = 0;
+
+    // Save pre-cut model state to restore if cuts don't help
+    const double pre_cut_tightened_dual = R.global_dual_bound;
+    const int pre_cut_nrows = base.nrows;
+    const int pre_cut_nnz = base.nnz;
+    const auto pre_cut_csr_inds = base.csr_inds;
+    const auto pre_cut_csr_offs = base.csr_offs;
+    const auto pre_cut_csr_vals = base.csr_vals;
+    const auto pre_cut_rhs = base.rhs;
+    const auto pre_cut_base_cuts = base.base_cuts;
+
+    for (int round = 0; round < R.config.cut_rounds_root; ++round) {
+        // Integral LP after cuts
+        if (static_cast<int>(cut_sol.col_value.size()) >= base.ncols &&
+            is_binary_integral(cut_sol.col_value, base.ncols, R.integ_tol) &&
+            R.try_adopt(cut_sol.primal_obj, cut_sol.col_value, "cut_round_exact")) {
+            if (R.verbosity >= 2)
+                fprintf(stderr, "  Cut round %d: LP integral, incumbent %.12g\n", round + 1, R.inc.obj);
+            break;
         }
 
-        // Re-validate incumbent against current model after RC fixing.
-        // RC fixing may have removed columns that were in the incumbent,
-        // making the incumbent infeasible on the reduced model.
-        if (std::isfinite(best_obj) && !best_solution.empty()) {
-            // Check feasibility: every row must be covered by active incumbent columns
-            bool incumbent_valid = true;
-            double validated_obj = 0.0;
-            for (int j = 0; j < ncols; ++j) {
-                const int orig = active_to_input[static_cast<size_t>(j)];
-                if (orig >= 0 && orig < ncols_input &&
-                    best_solution[static_cast<size_t>(orig)] > 0.5)
-                    validated_obj += obj[static_cast<size_t>(j)];
-            }
-            for (int i = 0; i < nrows && incumbent_valid; ++i) {
-                double row_sum = 0.0;
-                for (int k = csr_offs[static_cast<size_t>(i)];
-                     k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                    const int c = csr_inds[static_cast<size_t>(k)];
-                    if (c >= 0 && c < ncols) {
-                        const int orig = active_to_input[static_cast<size_t>(c)];
-                        if (orig >= 0 && orig < ncols_input &&
-                            best_solution[static_cast<size_t>(orig)] > 0.5)
-                            row_sum += csr_vals[static_cast<size_t>(k)];
-                    }
-                }
-                if (row_sum < 1.0 - tol) incumbent_valid = false;
-            }
-            if (!incumbent_valid || validated_obj > best_obj + tol) {
-                if (verbosity >= 3)
-                    fprintf(stderr, "  Incumbent invalidated after RC fixing (valid=%d, obj %.6g -> %.6g)\n",
-                            incumbent_valid ? 1 : 0, best_obj, validated_obj);
-                if (incumbent_valid) {
-                    best_obj = validated_obj;
-                } else {
-                    // Incumbent infeasible on reduced model; re-run heuristics
-                    best_obj = std::numeric_limits<double>::infinity();
-                    if (root_sol.solved && root_sol.optimal) {
-                        BranchNodeState reval_node;
-                        for (const auto &h : heuristics) {
-                            auto hr = h->tryBuild(root_sol.col_value, root_sol.row_dual, base, reval_node, integ_tol);
-                            if (hr.feasible && hr.objective < best_obj - tol) {
-                                best_obj = hr.objective;
-                                adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
-                                incumbent_source = std::string("reval_") + hr.name;
-                            }
-                        }
-                    }
-                    if (verbosity >= 3)
-                        fprintf(stderr, "  Re-computed incumbent: %.6g (%s)\n", best_obj, incumbent_source.c_str());
-                }
-            }
+        BranchNodeState empty_branch;
+        R.run_heuristics(cut_sol, empty_branch, "cut_", false);
+
+        // Update dual bound
+        if (cut_sol.optimal && std::isfinite(cut_sol.dual_obj)) {
+            double cut_dual = cut_sol.dual_obj;
+            if (cut_dual > R.global_dual_bound_raw) R.global_dual_bound_raw = cut_dual;
+            if (R.obj_is_integral) cut_dual = tighten_dual_bound(cut_dual, R.integ_tol);
+            if (cut_dual > R.global_dual_bound) R.global_dual_bound = cut_dual;
         }
 
-        // LP-based probing: fix x_j=0, check if infeasible or bound > incumbent
-        if (root_sol.solved && root_sol.optimal && std::isfinite(best_obj) && ncols <= 800) {
-            const auto probe_start = Clock::now();
-            const double probe_time_limit = 10.0;
-
-            // base and LP are already current from iterative RC fixing (or initial build)
-            {
-
-                // Only probe columns with x_j > 0 in LP (fixing x_j=0 when already at 0 is a no-op)
-                // Sort by decreasing LP value (most impactful to force to 0)
-                std::vector<int> probe_order;
-                for (int j = 0; j < ncols; ++j) {
-                    if (root_sol.col_value[static_cast<size_t>(j)] > tol)
-                        probe_order.push_back(j);
-                }
-                std::sort(probe_order.begin(), probe_order.end(),
-                          [&](int a, int b) { return root_sol.col_value[static_cast<size_t>(a)] > root_sol.col_value[static_cast<size_t>(b)]; });
-
-                std::vector<char> probe_fix_one(static_cast<size_t>(ncols), 0);
-                int probe_fixed = 0;
-                HighsBasis probe_basis = lp.get_basis();
-
-                for (int j : probe_order) {
-                    const double elapsed = std::chrono::duration<double>(Clock::now() - probe_start).count();
-                    if (elapsed > probe_time_limit) break;
-
-                    lp.restore_base_state();
-                    lp.set_basis(probe_basis);
-                    BranchDecision fix_zero{j, 0};
-                    lp.apply_decisions({fix_zero});
-                    auto probe_sol = lp.solve();
-                    ++total_lp_solves;
-
-                    if (!probe_sol.solved || probe_sol.infeasible ||
-                        (probe_sol.optimal && probe_sol.primal_obj > best_obj + tol)) {
-                        probe_fix_one[static_cast<size_t>(j)] = 1;
-                        ++probe_fixed;
-                    }
-                }
-
-                // Restore LP state
-                lp.restore_base_state();
-                lp.set_basis(probe_basis);
-
-                if (probe_fixed > 0) {
-                    if (verbosity >= 2)
-                        fprintf(stderr, "  LP probing: %d cols fixed to 1\n", probe_fixed);
-
-                    double probe_fixed_cost = 0.0;
-                    double probe_incumbent_cost = 0.0;
-                    std::vector<char> row_covered(static_cast<size_t>(nrows), 0);
-                    for (int j = 0; j < ncols; ++j) {
-                        if (!probe_fix_one[static_cast<size_t>(j)]) continue;
-                        probe_fixed_cost += obj[static_cast<size_t>(j)];
-                        const int orig = active_to_input[static_cast<size_t>(j)];
-                        fixed_original_cols.push_back(orig);
-                        if (!best_solution.empty() && orig >= 0 && orig < ncols_input &&
-                            best_solution[static_cast<size_t>(orig)] > 0.5)
-                            probe_incumbent_cost += obj[static_cast<size_t>(j)];
-                        for (const auto &entry : base.cols_to_rows[static_cast<size_t>(j)]) {
-                            if (entry.row >= 0 && entry.row < nrows && entry.val > 0.0)
-                                row_covered[static_cast<size_t>(entry.row)] = 1;
-                        }
-                    }
-
-                    // Rebuild without probed columns and their covered rows
-                    std::vector<int> old_col_to_new(static_cast<size_t>(ncols), -1);
-                    int new_ncols = 0;
-                    std::vector<int> new_active;
-                    std::vector<double> new_obj;
-                    for (int j = 0; j < ncols; ++j) {
-                        if (!probe_fix_one[static_cast<size_t>(j)]) {
-                            old_col_to_new[static_cast<size_t>(j)] = new_ncols++;
-                            new_active.push_back(active_to_input[static_cast<size_t>(j)]);
-                            new_obj.push_back(obj[static_cast<size_t>(j)]);
-                        }
-                    }
-                    int new_nrows = 0;
-                    std::vector<int> new_csr_offs, new_csr_inds;
-                    std::vector<double> new_csr_vals;
-                    new_csr_offs.push_back(0);
-                    for (int i = 0; i < nrows; ++i) {
-                        if (row_covered[static_cast<size_t>(i)]) continue;
-                        for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-                            const int c = csr_inds[static_cast<size_t>(k)];
-                            if (c >= 0 && c < ncols) {
-                                const int m = old_col_to_new[static_cast<size_t>(c)];
-                                if (m >= 0) {
-                                    new_csr_inds.push_back(m);
-                                    new_csr_vals.push_back(csr_vals[static_cast<size_t>(k)]);
-                                }
-                            }
-                        }
-                        new_csr_offs.push_back(static_cast<int>(new_csr_vals.size()));
-                        ++new_nrows;
-                    }
-
-                    ncols = new_ncols;
-                    nrows = new_nrows;
-                    csr_inds = std::move(new_csr_inds);
-                    csr_offs = std::move(new_csr_offs);
-                    csr_vals = std::move(new_csr_vals);
-                    obj = std::move(new_obj);
-                    active_to_input = std::move(new_active);
-
-                    fixed_preprocess_cost += probe_fixed_cost;
-                    best_obj -= probe_incumbent_cost;
-                    if (std::isfinite(global_dual_bound))
-                        global_dual_bound -= probe_fixed_cost;
-                    if (std::isfinite(global_dual_bound_raw))
-                        global_dual_bound_raw -= probe_fixed_cost;
-
-                    // Rebuild and re-solve for heuristics on reduced model
-                    build_base();
-                    lp.rebuild_model(base);
-                    root_sol = lp.solve();
-                    ++total_lp_solves;
-                    if (root_sol.solved && root_sol.optimal) {
-                        lp.save_basis();
-                        BranchNodeState probe_node;
-                        for (const auto &h : heuristics) {
-                            auto hr = h->tryBuild(root_sol.col_value, root_sol.row_dual, base, probe_node, integ_tol);
-                            if (hr.feasible && hr.objective < best_obj - tol) {
-                                best_obj = hr.objective;
-                                adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
-                                incumbent_source = std::string("probe_") + hr.name;
-                            }
-                        }
-                        csr_inds = base.csr_inds; csr_offs = base.csr_offs; csr_vals = base.csr_vals;
-                        obj = base.obj; active_to_input = base.active_to_original;
-                        ncols = base.ncols;
-                    }
-                }
+        // Separate
+        std::vector<CutConstraint> round_cuts;
+        for (const auto &sep : separators) {
+            auto sep_cuts = sep->separate(cut_sol.col_value, cut_sol.row_dual,
+                                          base, base.ncols, R.integ_tol, R.cutoff());
+            for (auto &c : sep_cuts) {
+                if (static_cast<int>(round_cuts.size()) >= R.config.max_cuts_per_round) break;
+                round_cuts.push_back(std::move(c));
             }
+            if (static_cast<int>(round_cuts.size()) >= R.config.max_cuts_per_round) break;
+        }
+        if (round_cuts.empty()) {
+            if (R.verbosity >= 3)
+                fprintf(stderr, "  Cut round %d: no violated cuts\n", round + 1);
+            break;
         }
 
-        // Post-LP reduction (first round)
-        apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                             best_obj, tol, verbosity);
-        apply_budget_pruning_preprocess(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                        best_obj, tol, config.preprocess_time_limit, verbosity);
-        apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                  config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
-        {
-            auto rr2 = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                  tol, config.preprocess_time_limit, verbosity);
-            if (rr2.cols_fixed > 0 || rr2.rows_removed > 0) {
-                fixed_preprocess_cost += rr2.fixed_cost;
-                for (int c : rr2.fixed_original_cols) fixed_original_cols.push_back(c);
-                best_obj -= rr2.fixed_cost;
-                if (std::isfinite(global_dual_bound))
-                    global_dual_bound -= rr2.fixed_cost;
-                if (std::isfinite(global_dual_bound_raw))
-                    global_dual_bound_raw -= rr2.fixed_cost;
-            }
-            // Iterate only if row reduction found something
-            if (rr2.cols_fixed > 0 || rr2.rows_removed > 0) {
-                const int max_extra_rounds = 9;
-                for (int round = 0; round < max_extra_rounds; ++round) {
-                    const int ncols_start = ncols;
-                    const int nrows_start = nrows;
-                    apply_cost_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                         best_obj, tol, verbosity);
-                    apply_dominance_reduction(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                              config.preprocess_rules, tol, config.preprocess_time_limit, verbosity);
-                    auto rr3 = row_reduce(nrows, ncols, csr_inds, csr_offs, csr_vals, obj, active_to_input,
-                                          tol, config.preprocess_time_limit, verbosity);
-                    if (rr3.cols_fixed > 0 || rr3.rows_removed > 0) {
-                        fixed_preprocess_cost += rr3.fixed_cost;
-                        for (int c : rr3.fixed_original_cols) fixed_original_cols.push_back(c);
-                        best_obj -= rr3.fixed_cost;
-                        if (std::isfinite(global_dual_bound))
-                            global_dual_bound -= rr3.fixed_cost;
-                        if (std::isfinite(global_dual_bound_raw))
-                            global_dual_bound_raw -= rr3.fixed_cost;
-                    }
-                    if (ncols == ncols_start && nrows == nrows_start) break;
-                    if (verbosity >= 3)
-                        fprintf(stderr, "  Post-LP round %d: %d/%d -> %d/%d (cols/rows)\n",
-                                round + 2, ncols_start, nrows_start, ncols, nrows);
-                }
-            }
-        }
-        if (ncols < cols_before && verbosity >= 2)
-            fprintf(stderr, "  Post-LP reduction: cols %d -> %d, rows %d\n", cols_before, ncols, nrows);
+        append_cuts_to_base_model(base, round_cuts);
+        root_cuts_added += static_cast<int>(round_cuts.size());
+        if (R.verbosity >= 3)
+            fprintf(stderr, "  Cut round %d: added %d cuts (model %d rows)\n",
+                    round + 1, static_cast<int>(round_cuts.size()), base.nrows);
+
+        // Rebuild LP with cuts
+        R.lp.rebuild_model(base);
+        cut_sol = R.lp.solve();
+        ++R.total_lp_solves;
+        if (!cut_sol.solved || !cut_sol.optimal) break;
+        R.lp.save_basis();
     }
 
-    // ================================================================
-    // Phase 6: Build base model for BnB
-    // ================================================================
-    build_base();
-    lp.rebuild_model(base);
+    // For integer objectives, cuts that don't push the LP past the next
+    // integer provide no benefit and can disrupt branching topology.
+    if (root_cuts_added > 0 && R.global_dual_bound <= pre_cut_tightened_dual + R.tol) {
+        base.nrows = pre_cut_nrows;
+        base.nnz = pre_cut_nnz;
+        base.csr_inds = pre_cut_csr_inds;
+        base.csr_offs = pre_cut_csr_offs;
+        base.csr_vals = pre_cut_csr_vals;
+        base.rhs = pre_cut_rhs;
+        base.base_cuts = pre_cut_base_cuts;
+        R.lp.rebuild_model(base);
+        if (R.verbosity >= 2)
+            fprintf(stderr, "  Root cuts undone: no tightened dual improvement\n");
+    } else if (root_cuts_added > 0 && R.verbosity >= 2) {
+        fprintf(stderr, "  Root cuts: %d total (dual %.12g -> %.12g)\n",
+                root_cuts_added, pre_cut_tightened_dual, R.global_dual_bound);
+    }
+}
 
-    if (root_sol.solved && root_sol.optimal) {
-        // Re-solve to get warm basis for reduced model
-        root_sol = lp.solve();
-        ++total_lp_solves;
-        if (root_sol.solved && root_sol.optimal) lp.save_basis();
+void run_root_balas_cuts(SolverRun &R) {
+    if (!R.config.balas_enabled || !R.root_sol.solved || !R.root_sol.optimal) return;
+
+    BaseRelaxationModel &base = R.base;
+    LpSolution balas_sol = R.lp.solve();
+    ++R.total_lp_solves;
+    if (!balas_sol.solved || !balas_sol.optimal) return;
+
+    auto rcosts = compute_reduced_costs(base.obj, balas_sol.row_dual, base, base.ncols);
+    auto br = balas_branch_generate(balas_sol.col_value, balas_sol.row_dual, rcosts,
+                                    R.cutoff(), base, base.ncols, R.config.balas_max_branches,
+                                    R.integ_tol, false);
+    if (br.sets.empty()) return;
+
+    std::vector<CutConstraint> balas_cuts;
+    for (const auto &R_k : br.sets) {
+        // Only add cover cuts that are violated by the LP
+        double lhs_val = 0.0;
+        for (const int j : R_k) {
+            if (j >= 0 && j < base.ncols)
+                lhs_val += balas_sol.col_value[static_cast<size_t>(j)];
+        }
+        if (lhs_val >= 1.0 - R.integ_tol) continue;
+
+        CutConstraint cut;
+        cut.indices.reserve(R_k.size());
+        cut.values.reserve(R_k.size());
+        for (const int j : R_k) {
+            cut.indices.push_back(j);
+            cut.values.push_back(1.0);
+        }
+        cut.rhs = 1.0;
+        cut.type = ">=";
+        balas_cuts.push_back(std::move(cut));
+    }
+    if (balas_cuts.empty()) return;
+
+    append_cuts_to_base_model(base, balas_cuts);
+    R.lp.rebuild_model(base);
+    if (R.verbosity >= 2)
+        fprintf(stderr, "  Root Balas cover cuts: %d added (from %d sets)\n",
+                static_cast<int>(balas_cuts.size()), static_cast<int>(br.sets.size()));
+}
+
+void prepare_bnb_model(SolverRun &R) {
+    R.build_base();
+    R.lp.rebuild_model(R.base);
+
+    if (R.root_sol.solved && R.root_sol.optimal) {
+        // Re-solve to get a warm basis for the reduced model
+        R.root_sol = R.lp.solve();
+        ++R.total_lp_solves;
+        if (R.root_sol.solved && R.root_sol.optimal) R.lp.save_basis();
     }
 
-    if (verbosity >= 2) {
+    if (R.verbosity >= 2) {
+        const BaseRelaxationModel &base = R.base;
         const double density = (base.nrows > 0 && base.ncols > 0)
             ? 100.0 * base.nnz / (static_cast<double>(base.nrows) * base.ncols)
             : 0.0;
@@ -1197,173 +994,42 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 base.nrows, base.ncols, base.nnz, density);
     }
 
-    // ================================================================
-    // Phase 6.5: Root cut separation rounds
-    // ================================================================
-    int root_cuts_added = 0;
-    if (config.cuts_enabled && config.cut_rounds_root > 0 && root_sol.solved && root_sol.optimal) {
-        auto separators = make_cut_separators();
-        LpSolution cut_sol = root_sol;
+    run_root_cut_rounds(R);
+    run_root_balas_cuts(R);
 
-        // Save pre-cut model state to restore if cuts don't help
-        const double pre_cut_tightened_dual = global_dual_bound;
-        const int pre_cut_nrows = base.nrows;
-        const int pre_cut_nnz = base.nnz;
-        const auto pre_cut_csr_inds = base.csr_inds;
-        const auto pre_cut_csr_offs = base.csr_offs;
-        const auto pre_cut_csr_vals = base.csr_vals;
-        const auto pre_cut_rhs = base.rhs;
-        const auto pre_cut_base_cuts = base.base_cuts;
-
-        for (int round = 0; round < config.cut_rounds_root; ++round) {
-            // Check integrality
-            if (static_cast<int>(cut_sol.col_value.size()) >= base.ncols &&
-                is_binary_integral(cut_sol.col_value, base.ncols, integ_tol) &&
-                cut_sol.primal_obj < best_obj - tol) {
-                best_obj = cut_sol.primal_obj;
-                adopt_incumbent_solution(best_solution, cut_sol.col_value, base.ncols, ncols_input, base.active_to_original);
-                incumbent_source = "cut_round_exact";
-                if (verbosity >= 2)
-                    fprintf(stderr, "  Cut round %d: LP integral, incumbent %.12g\n", round + 1, best_obj);
-                break;
-            }
-
-            // Heuristics
-            BranchNodeState empty_branch;
-            for (const auto &h : heuristics) {
-                auto hr = h->tryBuild(cut_sol.col_value, cut_sol.row_dual, base, empty_branch, integ_tol);
-                if (hr.feasible && hr.objective < best_obj - tol) {
-                    best_obj = hr.objective;
-                    adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
-                    incumbent_source = std::string("cut_") + hr.name;
-                }
-            }
-
-            // Update dual bound
-            if (cut_sol.optimal && std::isfinite(cut_sol.dual_obj)) {
-                double cut_dual = cut_sol.dual_obj;
-                if (cut_dual > global_dual_bound_raw) global_dual_bound_raw = cut_dual;
-                if (obj_is_integral) cut_dual = tighten_dual_bound(cut_dual, integ_tol);
-                if (cut_dual > global_dual_bound) global_dual_bound = cut_dual;
-            }
-
-            // Separate
-            std::vector<CutConstraint> round_cuts;
-            for (const auto &sep : separators) {
-                auto sep_cuts = sep->separate(cut_sol.col_value, cut_sol.row_dual,
-                                              base, base.ncols, integ_tol, best_obj);
-                for (auto &c : sep_cuts) {
-                    if (static_cast<int>(round_cuts.size()) >= config.max_cuts_per_round) break;
-                    round_cuts.push_back(std::move(c));
-                }
-                if (static_cast<int>(round_cuts.size()) >= config.max_cuts_per_round) break;
-            }
-            if (round_cuts.empty()) {
-                if (verbosity >= 3)
-                    fprintf(stderr, "  Cut round %d: no violated cuts\n", round + 1);
-                break;
-            }
-
-            append_cuts_to_base_model(base, round_cuts);
-            root_cuts_added += static_cast<int>(round_cuts.size());
-            if (verbosity >= 3)
-                fprintf(stderr, "  Cut round %d: added %d cuts (model %d rows)\n",
-                        round + 1, static_cast<int>(round_cuts.size()), base.nrows);
-
-            // Rebuild LP with cuts
-            lp.rebuild_model(base);
-            cut_sol = lp.solve();
-            ++total_lp_solves;
-            if (!cut_sol.solved || !cut_sol.optimal) break;
-            lp.save_basis();
-        }
-
-        // Check if cuts actually improved the tightened dual bound.
-        // For integer objectives, cuts that don't push the LP past the next integer
-        // provide no benefit and can disrupt branching topology.
-        if (root_cuts_added > 0 && global_dual_bound <= pre_cut_tightened_dual + tol) {
-            // Cuts didn't improve the tightened bound — restore pre-cut model
-            base.nrows = pre_cut_nrows;
-            base.nnz = pre_cut_nnz;
-            base.csr_inds = pre_cut_csr_inds;
-            base.csr_offs = pre_cut_csr_offs;
-            base.csr_vals = pre_cut_csr_vals;
-            base.rhs = pre_cut_rhs;
-            base.base_cuts = pre_cut_base_cuts;
-            lp.rebuild_model(base);
-            root_cuts_added = 0;
-            if (verbosity >= 2)
-                fprintf(stderr, "  Root cuts undone: no tightened dual improvement\n");
-        } else if (root_cuts_added > 0 && verbosity >= 2) {
-            fprintf(stderr, "  Root cuts: %d total (dual %.12g -> %.12g)\n",
-                    root_cuts_added, pre_cut_tightened_dual, global_dual_bound);
-        }
-    }
-
-    // ================================================================
-    // Phase 6.6: Root Balas cover cuts
-    // ================================================================
-    int root_balas_cuts_added = 0;
-    if (config.balas_enabled && root_sol.solved && root_sol.optimal) {
-        // Reuse existing LP solution (avoid unnecessary re-solve that perturbs basis)
-        LpSolution balas_sol = lp.solve();
-        ++total_lp_solves;
-        if (balas_sol.solved && balas_sol.optimal) {
-            auto rcosts = compute_reduced_costs(base.obj, balas_sol.row_dual, base, base.ncols);
-            auto br = balas_branch_generate(balas_sol.col_value, balas_sol.row_dual, rcosts,
-                                            best_obj, base, base.ncols, config.balas_max_branches,
-                                            integ_tol, false);
-            if (!br.sets.empty()) {
-                std::vector<CutConstraint> balas_cuts;
-                for (const auto &R_k : br.sets) {
-                    // Only add cover cuts that are violated by the LP
-                    double lhs_val = 0.0;
-                    for (const int j : R_k) {
-                        if (j >= 0 && j < base.ncols)
-                            lhs_val += balas_sol.col_value[static_cast<size_t>(j)];
-                    }
-                    if (lhs_val >= 1.0 - integ_tol) continue;
-
-                    CutConstraint cut;
-                    cut.indices.reserve(R_k.size());
-                    cut.values.reserve(R_k.size());
-                    for (const int j : R_k) {
-                        cut.indices.push_back(j);
-                        cut.values.push_back(1.0);
-                    }
-                    cut.rhs = 1.0;
-                    cut.type = ">=";
-                    balas_cuts.push_back(std::move(cut));
-                }
-                if (!balas_cuts.empty()) {
-                    append_cuts_to_base_model(base, balas_cuts);
-                    root_balas_cuts_added = static_cast<int>(balas_cuts.size());
-                    lp.rebuild_model(base);
-                    if (verbosity >= 2)
-                        fprintf(stderr, "  Root Balas cover cuts: %d added (from %d sets)\n",
-                                root_balas_cuts_added, static_cast<int>(br.sets.size()));
-                }
-            }
-        }
-    }
-
-    // ================================================================
-    // Phase 6.7: Post-cut budget pruning
-    // ================================================================
-    if (std::isfinite(best_obj)) {
+    // Post-cut budget pruning
+    if (std::isfinite(R.cutoff())) {
         ModelReductionResult budget_red = reduce_base_model_budget_pruning(
-            base, best_obj, tol, config.preprocess_time_limit);
+            R.base, R.cutoff(), R.tol, R.config.preprocess_time_limit);
         if (budget_red.columns_removed > 0) {
-            if (verbosity >= 3)
+            if (R.verbosity >= 3)
                 fprintf(stderr, "  Post-cut budget pruning: %d cols removed\n",
                         budget_red.columns_removed);
-            lp.rebuild_model(base);
+            R.base.build_transpose();
+            R.lp.rebuild_model(R.base);
         }
     }
+}
 
-    // ================================================================
-    // BnB main loop
-    // ================================================================
+// ======================================================================
+// Branch-and-bound
+// ======================================================================
+struct BnbOutcome {
+    int processed_nodes = 0;
+    bool gap_tolerance_reached = false;
+    bool hard_time_limit_reached = false;
+    bool frontier_exhausted = false;
+};
+
+BnbOutcome run_branch_and_bound(SolverRun &R) {
+    BnbOutcome out;
+    const SolverConfig &config = R.config;
+    const int verbosity = R.verbosity;
+    const double tol = R.tol;
+    const double integ_tol = R.integ_tol;
+    BaseRelaxationModel &base = R.base;
+    LpSolver &lp = R.lp;
+
     const bool use_reliability = (config.branch_strategy == "reliability");
     auto selector = make_branch_selector(
         use_reliability ? "most_fractional" : config.branch_strategy);
@@ -1399,12 +1065,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     std::unordered_map<int, HighsBasis> node_bases;
     {
         BranchNodeState root_state;
-        root_state.parent_dual_bound = std::isfinite(global_dual_bound)
-                                           ? global_dual_bound
-                                           : -std::numeric_limits<double>::infinity();
-        root_state.parent_dual_bound_raw = std::isfinite(global_dual_bound_raw)
-                                               ? global_dual_bound_raw
-                                               : -std::numeric_limits<double>::infinity();
+        root_state.parent_dual_bound = std::isfinite(R.global_dual_bound)
+                                           ? R.global_dual_bound : -kInf;
+        root_state.parent_dual_bound_raw = std::isfinite(R.global_dual_bound_raw)
+                                               ? R.global_dual_bound_raw : -kInf;
         nodes.push_back(root_state);
     }
 
@@ -1413,12 +1077,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     frontier.push(0);
 
     int processed_nodes = 0;
-    bool gap_tolerance_reached = false;
-    bool hard_time_limit_reached = false;
-    bool frontier_exhausted = false;
 
     const int gap_stagnation_window = config.gap_stagnation_window;
-    double best_mip_gap_seen = std::numeric_limits<double>::infinity();
+    double best_mip_gap_seen = kInf;
     int node_at_last_gap_improvement = 0;
 
     double cut_accumulator = 0.0;
@@ -1438,29 +1099,67 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
     double next_log_sec = config.log_interval_seconds;
     int log_event_count = 0;
 
+    // Everything that has to happen after the incumbent improved: prune the
+    // frontier, drop columns that can no longer be in an improving solution,
+    // and keep the LP, adjacency and symmetry caches in sync.
+    //
+    // If columns were removed while `current` (the node being processed) is
+    // still needed, it is remapped and re-enqueued with the given bound, and
+    // the caller must stop processing it (its LP solution and basis refer to
+    // the old column space). Returns true in that case.
+    auto on_new_incumbent = [&](BranchNodeState *current, double cur_bound,
+                                double cur_bound_raw) -> bool {
+        node_at_last_gap_improvement = processed_nodes;
+        frontier.prune(R.cutoff(), tol, verbosity, &node_bases);
+
+        bool current_alive = (current != nullptr);
+        bool changed = false;
+        if (mid_bnb_column_removal(base, R.cutoff(), tol, frontier, nodes, verbosity,
+                                   &pc_state, current, &current_alive) > 0)
+            changed = true;
+        if (mid_bnb_budget_pruning(base, R.cutoff(), tol, config.preprocess_time_limit,
+                                   frontier, nodes, verbosity,
+                                   &pc_state, current, &current_alive) > 0)
+            changed = true;
+        if (!changed) return false;
+
+        lp.rebuild_model_keep_basis(base);
+        adj_valid = false;
+        orbital_valid = false;
+
+        if (current && current_alive && cur_bound < R.cutoff() - tol) {
+            BranchNodeState requeue = *current;
+            requeue.parent_dual_bound = cur_bound;
+            requeue.parent_dual_bound_raw = cur_bound_raw;
+            const int id = static_cast<int>(nodes.size());
+            nodes.push_back(std::move(requeue));
+            frontier.push(id);
+        }
+        return true;
+    };
+
     if (verbosity >= 2)
         fprintf(stderr, "Branch-and-bound started (max_nodes=%d)\n", config.max_nodes);
 
     while (processed_nodes < config.max_nodes) {
         // Time limit check
         const auto now = Clock::now();
-        const double elapsed = std::chrono::duration<double>(now - start_time).count();
+        const double elapsed = std::chrono::duration<double>(now - R.start_time).count();
         if (config.time_limit_seconds > 0.0 && elapsed >= config.time_limit_seconds) {
-            hard_time_limit_reached = true;
+            out.hard_time_limit_reached = true;
             if (verbosity >= 1)
                 fprintf(stderr, "  [%8.3fs] Time limit reached\n", elapsed);
             break;
         }
 
-        // Gap check
-        if (std::isfinite(best_obj) && std::isfinite(global_dual_bound)) {
-            const double gap = compute_mip_gap(best_obj, global_dual_bound);
+        // Gap check (original space)
+        if (std::isfinite(R.inc.obj) && std::isfinite(R.global_dual_bound)) {
+            const double gap = compute_mip_gap(R.inc.obj, R.global_dual_bound + R.fixed_cost);
             if (std::isfinite(gap) && gap <= config.mip_gap_tol) {
-                gap_tolerance_reached = true;
-                if (verbosity >= 1) {
-                    const double t = std::chrono::duration<double>(now - start_time).count();
-                    fprintf(stderr, "  [%8.3fs] MIP gap %.8f%% within tolerance; optimal\n", t, gap * 100.0);
-                }
+                out.gap_tolerance_reached = true;
+                if (verbosity >= 1)
+                    fprintf(stderr, "  [%8.3fs] MIP gap %.8f%% within tolerance; optimal\n",
+                            elapsed, gap * 100.0);
                 break;
             }
         }
@@ -1470,30 +1169,31 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             const double bnb_elapsed = std::chrono::duration<double>(now - bnb_start).count();
             if (bnb_elapsed >= next_log_sec) {
                 if (verbosity >= 2) {
-                    const double gap = compute_mip_gap(best_obj, global_dual_bound_raw);
+                    const double dual_raw = R.global_dual_bound_raw + R.fixed_cost;
+                    const double gap = compute_mip_gap(R.inc.obj, dual_raw);
                     fprintf(stderr, "  [%8.3fs] nodes=%6d frontier=%6zu lp=%6d incumbent=%.8f dual=%.8f gap=",
-                            elapsed, processed_nodes, frontier.size(), total_lp_solves,
-                            best_obj, global_dual_bound_raw);
+                            elapsed, processed_nodes, frontier.size(), R.total_lp_solves,
+                            R.inc.obj, dual_raw);
                     if (std::isfinite(gap)) fprintf(stderr, "%.8f%%\n", gap * 100.0);
                     else fprintf(stderr, "inf\n");
                     ++log_event_count;
                     if (log_event_count % 10 == 0) {
-                        int total_cuts = base.nrows - nrows;
+                        const int total_cuts = base.nrows - R.wm.nrows;
                         fprintf(stderr, "           model: %d rows x %d cols, %d cuts\n",
                                 base.nrows, base.ncols, total_cuts);
                     }
                 }
-                next_log_sec = std::chrono::duration<double>(now - bnb_start).count() + config.log_interval_seconds;
+                next_log_sec = bnb_elapsed + config.log_interval_seconds;
             }
         }
 
         // Get next node
         if (frontier.empty()) {
-            frontier_exhausted = true;
+            out.frontier_exhausted = true;
             break;
         }
         const int node_id = frontier.pop();
-        const BranchNodeState branch_node = nodes[static_cast<size_t>(node_id)];
+        BranchNodeState branch_node = nodes[static_cast<size_t>(node_id)];
 
         // Reclaim memory from processed node
         {
@@ -1507,7 +1207,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         const bool has_node_basis = (basis_it != node_bases.end());
 
         // Bound check
-        if (branch_node.parent_dual_bound >= best_obj - tol) {
+        if (branch_node.parent_dual_bound >= R.cutoff() - tol) {
             if (has_node_basis) node_bases.erase(basis_it);
             continue;
         }
@@ -1563,61 +1263,30 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             }
         }
 
-        // Decomposition: if all linking columns are decided, solve sub-problems.
-        // Pass augmented_decisions (branch + propagated + orbital + RC) to
-        // solve_decomposed so sub-problems see the full node state.
-        if (decomp_state.enabled) {
-            const auto &eff_dec = augmented_decisions.empty()
-                                      ? branch_node.decisions
-                                      : augmented_decisions;
-            if (all_linkers_fixed(decomp_state, eff_dec)) {
-                const double bnb_elapsed = std::chrono::duration<double>(
-                    Clock::now() - start_time).count();
-                const double remaining = (config.time_limit_seconds > 0)
-                    ? std::max(1.0, config.time_limit_seconds - bnb_elapsed)
-                    : 60.0;
+        const auto &effective_decisions = augmented_decisions.empty()
+                                              ? branch_node.decisions
+                                              : augmented_decisions;
 
-                auto dr = solve_decomposed(base, eff_dec, decomp_state,
-                                           best_obj, config, remaining, verbosity);
-                if (dr.solved) {
-                    // Sub-problems fully explored this subtree
-                    if (dr.improved) {
-                        best_obj = dr.combined_obj;
-                        adopt_incumbent_solution(best_solution, dr.combined_solution,
-                                                 base.ncols, ncols_input,
-                                                 base.active_to_original);
-                        incumbent_source = "decomposition";
-                        if (verbosity >= 2) {
-                            const double t = std::chrono::duration<double>(
-                                Clock::now() - start_time).count();
-                            fprintf(stderr,
-                                "* [%8.3fs] New incumbent: %.8f (from decomposition)\n",
-                                t, best_obj);
-                        }
-                        node_at_last_gap_improvement = processed_nodes;
-                        frontier.prune(best_obj, tol, verbosity, &node_bases);
-                        if (mid_bnb_column_removal(base, best_obj, tol, frontier,
-                                                    nodes, verbosity, &pc_state) > 0) {
-                            lp.rebuild_model_keep_basis(base);
-                            adj_valid = false; orbital_valid = false;
-                        }
-                        if (mid_bnb_budget_pruning(base, best_obj, tol,
-                                                    config.preprocess_time_limit,
-                                                    frontier, nodes, verbosity,
-                                                    &pc_state) > 0) {
-                            lp.rebuild_model_keep_basis(base);
-                            adj_valid = false; orbital_valid = false;
-                        }
-                    }
-                    continue; // skip LP solve/branch — subtree handled
-                }
-                // Decomposition failed (infeasible block or no split):
-                // fall through to normal LP solve + branching
+        // Decomposition: if all linking columns are decided, solve sub-problems.
+        if (decomp_state.enabled && all_linkers_fixed(decomp_state, effective_decisions)) {
+            const double remaining = (config.time_limit_seconds > 0)
+                ? std::max(1.0, config.time_limit_seconds - R.elapsed())
+                : 60.0;
+
+            auto dr = solve_decomposed(base, effective_decisions, decomp_state,
+                                       R.cutoff(), config, remaining, verbosity);
+            if (dr.solved) {
+                // Sub-problems fully explored this subtree
+                if (dr.improved && R.try_adopt(dr.combined_obj, dr.combined_solution, "decomposition"))
+                    on_new_incumbent(nullptr, 0.0, 0.0);
+                continue; // skip LP solve/branch: subtree handled
             }
+            // Decomposition failed (infeasible block or no split):
+            // fall through to normal LP solve + branching
         }
 
         // Solve LP with per-node basis warm-start
-        lp.apply_decisions(augmented_decisions.empty() ? branch_node.decisions : augmented_decisions);
+        lp.apply_decisions(effective_decisions);
         lp.add_cuts(branch_node.cuts);
         if (has_node_basis) {
             lp.set_basis(basis_it->second);
@@ -1626,7 +1295,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             lp.restore_basis();
         }
         LpSolution sol = lp.solve();
-        ++total_lp_solves;
+        ++R.total_lp_solves;
         lp.save_basis();
         HighsBasis node_basis = lp.get_basis();
         lp.restore_base_state();
@@ -1640,7 +1309,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
 
         double node_dual_bound_raw = sol.optimal ? sol.dual_obj : branch_node.parent_dual_bound_raw;
         double node_dual_bound = sol.optimal ? sol.dual_obj : branch_node.parent_dual_bound;
-        if (obj_is_integral && sol.optimal && std::isfinite(node_dual_bound))
+        if (R.obj_is_integral && sol.optimal && std::isfinite(node_dual_bound))
             node_dual_bound = tighten_dual_bound(node_dual_bound, integ_tol);
 
         const bool dual_improved = sol.optimal &&
@@ -1650,31 +1319,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         if (processed_nodes == 1 ||
             (config.heuristic_frequency > 0 && processed_nodes % config.heuristic_frequency == 0) ||
             dual_improved) {
-            bool incumbent_improved = false;
-            for (const auto &h : heuristics) {
-                auto hr = h->tryBuild(sol.col_value, sol.row_dual, base, branch_node, integ_tol);
-                if (hr.feasible && hr.objective < best_obj - tol) {
-                    best_obj = hr.objective;
-                    adopt_incumbent_solution(best_solution, hr.solution, base.ncols, ncols_input, base.active_to_original);
-                    incumbent_source = hr.name;
-                    incumbent_improved = true;
-                    if (verbosity >= 2) {
-                        const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
-                        fprintf(stderr, "* [%8.3fs] New incumbent: %.8f (from %s)\n", t, best_obj, hr.name.c_str());
-                    }
-                    break;
-                }
-            }
-            if (incumbent_improved) {
-                node_at_last_gap_improvement = processed_nodes;
-                frontier.prune(best_obj, tol, verbosity, &node_bases);
-                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0) {
-                    lp.rebuild_model_keep_basis(base); adj_valid = false; orbital_valid = false;
-                }
-                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0) {
-                    lp.rebuild_model_keep_basis(base); adj_valid = false; orbital_valid = false;
-                }
-            }
+            if (R.run_heuristics(sol, branch_node, "", true) &&
+                on_new_incumbent(&branch_node, node_dual_bound, node_dual_bound_raw))
+                continue;
         }
 
         // Node-level Lagrangian heuristic
@@ -1684,184 +1331,90 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             if (lagrangian_accumulator >= 1.0) {
                 lagrangian_accumulator -= 1.0;
 
-                const auto &eff_dec = augmented_decisions.empty()
-                                          ? branch_node.decisions
-                                          : augmented_decisions;
-
                 auto lagr = lagrangian_relaxation_at_node(
-                    base, best_obj, sol.row_dual, eff_dec,
+                    base, R.cutoff(), sol.row_dual, effective_decisions,
                     50,   // max_iterations (reduced from 500)
                     0.5); // time_limit (reduced from 5.0)
 
-                if (lagr.best_heuristic_obj < best_obj - tol &&
-                    !lagr.best_solution.empty()) {
-                    best_obj = lagr.best_heuristic_obj;
-                    adopt_incumbent_solution(best_solution, lagr.best_solution,
-                                             base.ncols, ncols_input,
-                                             base.active_to_original);
-                    incumbent_source = "node_lagrangian";
-                    if (verbosity >= 2) {
-                        const double t = std::chrono::duration<double>(
-                            Clock::now() - start_time).count();
-                        fprintf(stderr,
-                            "* [%8.3fs] New incumbent: %.8f (from node_lagrangian)\n",
-                            t, best_obj);
-                    }
-                    node_at_last_gap_improvement = processed_nodes;
-                    frontier.prune(best_obj, tol, verbosity, &node_bases);
-                    if (mid_bnb_column_removal(base, best_obj, tol, frontier,
-                                                nodes, verbosity, &pc_state) > 0) {
-                        lp.rebuild_model_keep_basis(base);
-                        adj_valid = false; orbital_valid = false;
-                    }
-                    if (mid_bnb_budget_pruning(base, best_obj, tol,
-                                                config.preprocess_time_limit,
-                                                frontier, nodes, verbosity,
-                                                &pc_state) > 0) {
-                        lp.rebuild_model_keep_basis(base);
-                        adj_valid = false; orbital_valid = false;
-                    }
-                }
+                if (!lagr.best_solution.empty() &&
+                    R.try_adopt(lagr.best_heuristic_obj, lagr.best_solution, "node_lagrangian") &&
+                    on_new_incumbent(&branch_node, node_dual_bound, node_dual_bound_raw))
+                    continue;
             }
         }
 
-        // Diving heuristic (skip in proving phase — frontier shrinking)
+        // Diving heuristic (skip in proving phase: frontier shrinking)
         if (config.diving_frequency > 0.0 && sol.optimal && !proving_phase &&
-            node_dual_bound < best_obj - tol) {
+            node_dual_bound < R.cutoff() - tol) {
             diving_accumulator += config.diving_frequency;
             if (diving_accumulator >= 1.0) {
                 diving_accumulator -= 1.0;
 
                 auto dive = run_diving_heuristics(
-                    lp, base, branch_node, sol, best_obj, integ_tol,
+                    lp, base, branch_node, sol, R.cutoff(), integ_tol,
                     config.diving_max_lp_solves);
-                total_lp_solves += dive.lp_solves;
+                R.total_lp_solves += dive.lp_solves;
 
-                if (dive.found && dive.objective < best_obj - tol) {
-                    best_obj = dive.objective;
-                    adopt_incumbent_solution(best_solution, dive.solution,
-                                             base.ncols, ncols_input,
-                                             base.active_to_original);
-                    incumbent_source = dive.strategy_name;
-                    if (verbosity >= 2) {
-                        const double t = std::chrono::duration<double>(
-                            Clock::now() - start_time).count();
-                        fprintf(stderr,
-                            "* [%8.3fs] New incumbent: %.8f (from %s)\n",
-                            t, best_obj, dive.strategy_name.c_str());
-                    }
-                    node_at_last_gap_improvement = processed_nodes;
-                    frontier.prune(best_obj, tol, verbosity, &node_bases);
-                    if (mid_bnb_column_removal(base, best_obj, tol, frontier,
-                                                nodes, verbosity, &pc_state) > 0) {
-                        lp.rebuild_model_keep_basis(base);
-                        adj_valid = false; orbital_valid = false;
-                    }
-                    if (mid_bnb_budget_pruning(base, best_obj, tol,
-                                                config.preprocess_time_limit,
-                                                frontier, nodes, verbosity,
-                                                &pc_state) > 0) {
-                        lp.rebuild_model_keep_basis(base);
-                        adj_valid = false; orbital_valid = false;
-                    }
-                }
+                if (dive.found &&
+                    R.try_adopt(dive.objective, dive.solution, dive.strategy_name) &&
+                    on_new_incumbent(&branch_node, node_dual_bound, node_dual_bound_raw))
+                    continue;
             }
         }
 
-        // RINS heuristic (skip in proving phase — frontier shrinking)
+        // RINS heuristic (skip in proving phase: frontier shrinking)
         if (config.rins_frequency > 0.0 && sol.optimal && !proving_phase &&
-            !best_solution.empty() && node_dual_bound < best_obj - tol) {
+            !R.inc.solution.empty() && node_dual_bound < R.cutoff() - tol) {
             rins_accumulator += config.rins_frequency;
             if (rins_accumulator >= 1.0) {
                 rins_accumulator -= 1.0;
 
-                // Build incumbent in active column space (lazy)
+                // Incumbent restricted to the active columns
                 incumbent_active.assign(static_cast<size_t>(base.ncols), 0.0);
                 for (int j = 0; j < base.ncols; ++j) {
                     const int orig = base.active_to_original[static_cast<size_t>(j)];
-                    if (orig >= 0 && orig < ncols_input &&
-                        best_solution[static_cast<size_t>(orig)] > 0.5)
+                    if (orig >= 0 && orig < R.ncols_input &&
+                        R.inc.solution[static_cast<size_t>(orig)] > 0.5)
                         incumbent_active[static_cast<size_t>(j)] = 1.0;
                 }
 
-                const double bnb_elapsed = std::chrono::duration<double>(
-                    Clock::now() - start_time).count();
                 const double remaining = (config.time_limit_seconds > 0)
-                    ? std::max(1.0, config.time_limit_seconds - bnb_elapsed)
+                    ? std::max(1.0, config.time_limit_seconds - R.elapsed())
                     : 30.0;
 
-                auto rr = run_rins(base, sol, incumbent_active, best_obj,
+                auto rr = run_rins(base, sol, incumbent_active, R.cutoff(),
                                    config, std::min(remaining, 30.0), verbosity);
-                total_lp_solves += rr.sub_lp_solves;
+                R.total_lp_solves += rr.sub_lp_solves;
 
-                if (rr.found && rr.objective < best_obj - tol) {
-                    best_obj = rr.objective;
-                    adopt_incumbent_solution(best_solution, rr.solution,
-                                             base.ncols, ncols_input,
-                                             base.active_to_original);
-                    incumbent_source = "rins";
-                    if (verbosity >= 2) {
-                        const double t = std::chrono::duration<double>(
-                            Clock::now() - start_time).count();
-                        fprintf(stderr,
-                            "* [%8.3fs] New incumbent: %.8f (from rins)\n",
-                            t, best_obj);
-                    }
-                    node_at_last_gap_improvement = processed_nodes;
-                    frontier.prune(best_obj, tol, verbosity, &node_bases);
-                    if (mid_bnb_column_removal(base, best_obj, tol, frontier,
-                                                nodes, verbosity, &pc_state) > 0) {
-                        lp.rebuild_model_keep_basis(base);
-                        adj_valid = false; orbital_valid = false;
-                    }
-                    if (mid_bnb_budget_pruning(base, best_obj, tol,
-                                                config.preprocess_time_limit,
-                                                frontier, nodes, verbosity,
-                                                &pc_state) > 0) {
-                        lp.rebuild_model_keep_basis(base);
-                        adj_valid = false; orbital_valid = false;
-                    }
-                }
+                if (rr.found &&
+                    R.try_adopt(rr.objective, rr.solution, "rins") &&
+                    on_new_incumbent(&branch_node, node_dual_bound, node_dual_bound_raw))
+                    continue;
             }
         }
 
         // Pruning by bound
-        if (node_dual_bound >= best_obj - tol) continue;
+        if (node_dual_bound >= R.cutoff() - tol) continue;
 
         // Integrality check
         if (sol.optimal && is_binary_integral(sol.col_value, base.ncols, integ_tol)) {
-            if (sol.primal_obj < best_obj - tol) {
-                best_obj = sol.primal_obj;
-                node_at_last_gap_improvement = processed_nodes;
-                adopt_incumbent_solution(best_solution, sol.col_value, base.ncols, ncols_input, base.active_to_original);
-                incumbent_source = "exact_node";
-                if (verbosity >= 2) {
-                    const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
-                    fprintf(stderr, "* [%8.3fs] New incumbent: %.8f (exact)\n", t, best_obj);
-                }
-                frontier.prune(best_obj, tol, verbosity, &node_bases);
-                if (mid_bnb_column_removal(base, best_obj, tol, frontier, nodes, verbosity, &pc_state) > 0) {
-                    lp.rebuild_model_keep_basis(base); adj_valid = false; orbital_valid = false;
-                }
-                if (mid_bnb_budget_pruning(base, best_obj, tol, config.preprocess_time_limit, frontier, nodes, verbosity, &pc_state) > 0) {
-                    lp.rebuild_model_keep_basis(base); adj_valid = false; orbital_valid = false;
-                }
-            }
+            if (R.try_adopt(sol.primal_obj, sol.col_value, "exact_node"))
+                on_new_incumbent(nullptr, 0.0, 0.0);
             continue;
         }
 
         // Compute reduced costs once per node (used by RC fixing and Balas)
         std::vector<double> rcosts;
         const bool need_rcosts = sol.optimal &&
-            ((std::isfinite(best_obj) && node_dual_bound < best_obj - tol) ||
+            ((std::isfinite(R.cutoff()) && node_dual_bound < R.cutoff() - tol) ||
              (config.balas_enabled && force_aggressive_branching));
         if (need_rcosts)
             rcosts = compute_reduced_costs(base.obj, sol.row_dual, base, base.ncols);
 
         // Node-level reduced cost fixing: fix variables that cannot improve
         std::vector<BranchDecision> rc_fixings;
-        if (!rcosts.empty() && std::isfinite(best_obj) && node_dual_bound < best_obj - tol) {
-            const double node_gap = best_obj - node_dual_bound;
+        if (!rcosts.empty() && std::isfinite(R.cutoff()) && node_dual_bound < R.cutoff() - tol) {
+            const double node_gap = R.cutoff() - node_dual_bound;
             for (int j = 0; j < base.ncols; ++j) {
                 if (sol.col_value[static_cast<size_t>(j)] < integ_tol &&
                     rcosts[static_cast<size_t>(j)] > node_gap + tol) {
@@ -1877,7 +1430,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
         bool used_balas = false;
         if (config.balas_enabled && force_aggressive_branching && !rcosts.empty()) {
             auto br = balas_branch_generate(sol.col_value, sol.row_dual, rcosts,
-                                            best_obj, base, base.ncols, config.balas_max_branches,
+                                            R.cutoff(), base, base.ncols, config.balas_max_branches,
                                             integ_tol, true);
             if (br.use_br1) {
                 auto children = balas_br1_children(branch_node, br.sets, node_dual_bound, node_dual_bound_raw);
@@ -1892,11 +1445,9 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     }
                 }
                 used_balas = (enqueued > 0);
-                if (verbosity >= 3) {
-                    const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
+                if (verbosity >= 3)
                     fprintf(stderr, "  [%8.3fs] Aggressive BR1: %d children from %d sets\n",
-                            t, enqueued, static_cast<int>(br.sets.size()));
-                }
+                            R.elapsed(), enqueued, static_cast<int>(br.sets.size()));
             }
             force_aggressive_branching = false;
         }
@@ -1905,13 +1456,8 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
             int branch_var = -1;
 
             // Priority: branch on unfixed linking columns first
-            if (decomp_state.enabled) {
-                const auto &eff_dec = augmented_decisions.empty()
-                                          ? branch_node.decisions
-                                          : augmented_decisions;
-                branch_var = pick_linking_branch_var(
-                    decomp_state, eff_dec, fractional);
-            }
+            if (decomp_state.enabled)
+                branch_var = pick_linking_branch_var(decomp_state, effective_decisions, fractional);
 
             if (branch_var < 0) {
                 if (use_reliability) {
@@ -1922,53 +1468,39 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     }
                     branch_var = reliability_branch_select(
                         pc_state, lp, base, branch_node, sol, fractional,
-                        best_obj, config.reliability_eta, config.reliability_max_sb,
+                        R.cutoff(), config.reliability_eta, config.reliability_max_sb,
                         integ_tol, verbosity, sb_lps, &cached_adj);
-                    total_lp_solves += sb_lps;
+                    R.total_lp_solves += sb_lps;
                 } else {
                     branch_var = selector->select(sol.col_value, base.obj, fractional);
                 }
             }
             if (branch_var < 0) continue;
 
-            BranchNodeState child_zero;
-            if (append_decision_if_consistent(branch_node, branch_var, 0, &child_zero)) {
+            for (int value = 0; value <= 1; ++value) {
+                BranchNodeState child;
+                if (!append_decision_if_consistent(branch_node, branch_var, value, &child)) continue;
                 for (const auto &rc : rc_fixings)
-                    child_zero.decisions.push_back(rc);
-                if (!is_node_provably_infeasible(child_zero, base)) {
-                    child_zero.parent_dual_bound = node_dual_bound;
-                    child_zero.parent_dual_bound_raw = node_dual_bound_raw;
-                    const int child_id = static_cast<int>(nodes.size());
-                    nodes.push_back(std::move(child_zero));
-                    node_bases[child_id] = node_basis;
-                    frontier.push(child_id);
-                }
-            }
-
-            BranchNodeState child_one;
-            if (append_decision_if_consistent(branch_node, branch_var, 1, &child_one)) {
-                for (const auto &rc : rc_fixings)
-                    child_one.decisions.push_back(rc);
-                if (!is_node_provably_infeasible(child_one, base)) {
-                    child_one.parent_dual_bound = node_dual_bound;
-                    child_one.parent_dual_bound_raw = node_dual_bound_raw;
-                    const int child_id = static_cast<int>(nodes.size());
-                    nodes.push_back(std::move(child_one));
-                    node_bases[child_id] = node_basis;
-                    frontier.push(child_id);
-                }
+                    child.decisions.push_back(rc);
+                if (is_node_provably_infeasible(child, base)) continue;
+                child.parent_dual_bound = node_dual_bound;
+                child.parent_dual_bound_raw = node_dual_bound_raw;
+                const int child_id = static_cast<int>(nodes.size());
+                nodes.push_back(std::move(child));
+                node_bases[child_id] = node_basis;
+                frontier.push(child_id);
             }
         }
 
         // Update global dual bound from heap top: O(1) instead of O(|frontier|)
         if (!frontier.empty()) {
-            global_dual_bound = frontier.top_bound();
-            global_dual_bound_raw = frontier.min_raw_bound;
+            R.global_dual_bound = frontier.top_bound();
+            R.global_dual_bound_raw = frontier.min_raw_bound;
         }
 
         // Stagnation control
-        if (gap_stagnation_window > 0 && std::isfinite(best_obj)) {
-            const double current_gap = compute_mip_gap(best_obj, global_dual_bound);
+        if (gap_stagnation_window > 0 && std::isfinite(R.inc.obj)) {
+            const double current_gap = compute_mip_gap(R.inc.obj, R.global_dual_bound + R.fixed_cost);
             if (std::isfinite(current_gap) && current_gap < best_mip_gap_seen - 1e-8) {
                 best_mip_gap_seen = current_gap;
                 node_at_last_gap_improvement = processed_nodes;
@@ -1979,9 +1511,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
 
                 // Dynamic decomposition activation after ~150s of BnB
                 if (!decomp_state.enabled && decomp_dynamic_eligible) {
-                    const double bnb_elapsed = std::chrono::duration<double>(
-                        Clock::now() - start_time).count();
-                    if (bnb_elapsed > 150.0) {
+                    if (R.elapsed() > 150.0) {
                         decomp_state = compute_decomposition(
                             base, config.decomposition_max_linkers, verbosity);
                         decomp_dynamic_eligible = false;
@@ -2000,22 +1530,15 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 }
                 if (!proving_phase && frontier_shrink_streak >= 5) {
                     proving_phase = true;
-                    if (verbosity >= 2) {
-                        const double t = std::chrono::duration<double>(
-                            Clock::now() - start_time).count();
-                        fprintf(stderr,
-                            "  [%8.3fs] Proving phase: frontier shrinking, "
-                            "disabling expensive heuristics\n", t);
-                    }
+                    if (verbosity >= 2)
+                        fprintf(stderr, "  [%8.3fs] Proving phase: frontier shrinking, "
+                                        "disabling expensive heuristics\n", R.elapsed());
                 }
                 if (proving_phase && frontier_shrink_streak <= -3) {
                     proving_phase = false;
-                    if (verbosity >= 2) {
-                        const double t = std::chrono::duration<double>(
-                            Clock::now() - start_time).count();
-                        fprintf(stderr,
-                            "  [%8.3fs] Exiting proving phase: frontier growing\n", t);
-                    }
+                    if (verbosity >= 2)
+                        fprintf(stderr, "  [%8.3fs] Exiting proving phase: frontier growing\n",
+                                R.elapsed());
                 }
                 const bool frontier_shrinking = (frontier_shrink_streak >= 2);
                 frontier_at_last_stagnation = frontier.size();
@@ -2027,7 +1550,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                     cut_accumulator -= 1.0;
 
                     // Save pre-cut state for rollback
-                    const double pre_cut_dual = global_dual_bound;
+                    const double pre_cut_dual = R.global_dual_bound;
                     const int pre_cut_nrows = base.nrows;
                     const int pre_cut_nnz = base.nnz;
                     const auto pre_cut_csr_inds = base.csr_inds;
@@ -2041,7 +1564,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                         std::vector<CutConstraint> round_cuts;
                         for (const auto &sep : cut_separators) {
                             auto sep_cuts = sep->separate(sol.col_value, sol.row_dual,
-                                                          base, base.ncols, integ_tol, best_obj);
+                                                          base, base.ncols, integ_tol, R.cutoff());
                             for (auto &c : sep_cuts) {
                                 if (static_cast<int>(round_cuts.size()) >= config.max_cuts_per_round) break;
                                 round_cuts.push_back(std::move(c));
@@ -2056,7 +1579,7 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                         lp.add_cuts(round_cuts);
                         lp.apply_decisions(branch_node.decisions);
                         LpSolution cut_sol = lp.solve();
-                        ++total_lp_solves;
+                        ++R.total_lp_solves;
                         if (!cut_sol.solved || !cut_sol.optimal) break;
                         lp.save_basis();
                         sol = cut_sol;
@@ -2069,10 +1592,10 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
 
                         // Validate: check if cuts improved the tightened dual
                         double post_cut_dual = sol.optimal ? sol.dual_obj : pre_cut_dual;
-                        if (obj_is_integral && std::isfinite(post_cut_dual))
+                        if (R.obj_is_integral && std::isfinite(post_cut_dual))
                             post_cut_dual = tighten_dual_bound(post_cut_dual, integ_tol);
                         if (post_cut_dual <= pre_cut_dual + tol) {
-                            // Cuts didn't help — rollback
+                            // Cuts didn't help: roll back
                             base.nrows = pre_cut_nrows;
                             base.nnz = pre_cut_nnz;
                             base.csr_inds = pre_cut_csr_inds;
@@ -2081,17 +1604,12 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                             base.rhs = pre_cut_rhs;
                             base.base_cuts = pre_cut_base_cuts;
                             lp.rebuild_model(base);
-                            if (verbosity >= 3) {
-                                const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
+                            if (verbosity >= 3)
                                 fprintf(stderr, "  [%8.3fs] Stagnation: %d mid-BnB cuts undone (no dual improvement)\n",
-                                        t, total_cuts);
-                            }
-                        } else {
-                            if (verbosity >= 3) {
-                                const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
-                                fprintf(stderr, "  [%8.3fs] Stagnation: added %d mid-BnB cuts (dual %.8f -> %.8f)\n",
-                                        t, total_cuts, pre_cut_dual, post_cut_dual);
-                            }
+                                        R.elapsed(), total_cuts);
+                        } else if (verbosity >= 3) {
+                            fprintf(stderr, "  [%8.3fs] Stagnation: added %d mid-BnB cuts (dual %.8f -> %.8f)\n",
+                                    R.elapsed(), total_cuts, pre_cut_dual, post_cut_dual);
                         }
                     }
                 }
@@ -2101,75 +1619,82 @@ SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
                 if (balas_accumulator >= 1.0 && config.balas_enabled) {
                     balas_accumulator -= 1.0;
                     force_aggressive_branching = true;
-                    if (verbosity >= 3) {
-                        const double t = std::chrono::duration<double>(Clock::now() - start_time).count();
-                        fprintf(stderr, "  [%8.3fs] Stagnation: aggressive Balas branching\n", t);
-                    }
+                    if (verbosity >= 3)
+                        fprintf(stderr, "  [%8.3fs] Stagnation: aggressive Balas branching\n", R.elapsed());
                 }
             }
         }
     }
 
-    // ================================================================
-    // Final reporting
-    // ================================================================
-    // Recompute global dual bound
+    // Final dual bound from the remaining frontier (reduced space)
     {
-        double new_bound = std::numeric_limits<double>::infinity();
-        double new_bound_raw = std::numeric_limits<double>::infinity();
+        double new_bound = kInf;
+        double new_bound_raw = kInf;
         for (const int idx : frontier.heap) {
             new_bound = std::min(new_bound, nodes[static_cast<size_t>(idx)].parent_dual_bound);
             new_bound_raw = std::min(new_bound_raw, nodes[static_cast<size_t>(idx)].parent_dual_bound_raw);
         }
-        if (std::isfinite(new_bound)) global_dual_bound = new_bound;
-        else if (frontier.empty() && std::isfinite(best_obj)) global_dual_bound = best_obj;
-        if (std::isfinite(new_bound_raw)) global_dual_bound_raw = new_bound_raw;
-        else if (frontier.empty() && std::isfinite(best_obj)) global_dual_bound_raw = best_obj;
+        if (std::isfinite(new_bound)) R.global_dual_bound = new_bound;
+        else if (frontier.empty() && std::isfinite(R.inc.obj)) R.global_dual_bound = R.cutoff();
+        if (std::isfinite(new_bound_raw)) R.global_dual_bound_raw = new_bound_raw;
+        else if (frontier.empty() && std::isfinite(R.inc.obj)) R.global_dual_bound_raw = R.cutoff();
     }
 
-    const auto end_time = Clock::now();
-    result.wall_time = std::chrono::duration<double>(end_time - start_time).count();
-    result.nodes_processed = processed_nodes;
-    result.lp_solves = total_lp_solves;
+    out.processed_nodes = processed_nodes;
+    return out;
+}
 
-    // Add back the cost of columns fixed during preprocessing
-    best_obj += fixed_preprocess_cost;
-    global_dual_bound += fixed_preprocess_cost;
-    global_dual_bound_raw += fixed_preprocess_cost;
+SolverResult make_result(const SolverRun &R, const BnbOutcome &out) {
+    SolverResult result;
+    result.wall_time = R.elapsed();
+    result.nodes_processed = out.processed_nodes;
+    result.lp_solves = R.total_lp_solves;
 
-    // Include fixed columns in the solution
-    if (!fixed_original_cols.empty()) {
-        if (best_solution.empty())
-            best_solution.assign(static_cast<size_t>(ncols_input), 0.0);
-        for (int c : fixed_original_cols) {
-            if (c >= 0 && c < ncols_input)
-                best_solution[static_cast<size_t>(c)] = 1.0;
-        }
-    }
+    // Dual bound in the original space
+    const double dual_total = R.global_dual_bound + R.fixed_cost;
 
-    if (std::isfinite(best_obj)) {
-        result.primal_obj = best_obj;
-        result.solution = best_solution;
+    if (std::isfinite(R.inc.obj)) {
+        result.primal_obj = R.inc.obj;
+        result.solution = R.inc.solution;
 
-        if ((frontier_exhausted || gap_tolerance_reached) &&
-            !hard_time_limit_reached &&
-            processed_nodes < config.max_nodes) {
-            result.dual_obj = best_obj;
+        if ((out.frontier_exhausted || out.gap_tolerance_reached) &&
+            !out.hard_time_limit_reached &&
+            out.processed_nodes < R.config.max_nodes) {
+            result.dual_obj = R.inc.obj;
             result.mip_gap = 0.0;
             result.status = "Optimal";
         } else {
-            result.dual_obj = global_dual_bound;
-            result.mip_gap = compute_mip_gap(best_obj, global_dual_bound);
-            result.status = hard_time_limit_reached ? "TimeLimit" : "NodeLimit";
+            result.dual_obj = dual_total;
+            result.mip_gap = compute_mip_gap(R.inc.obj, dual_total);
+            result.status = out.hard_time_limit_reached ? "TimeLimit" : "NodeLimit";
         }
     } else {
-        result.primal_obj = std::numeric_limits<double>::infinity();
-        result.dual_obj = global_dual_bound;
-        result.mip_gap = std::numeric_limits<double>::infinity();
+        result.primal_obj = kInf;
+        result.dual_obj = dual_total;
+        result.mip_gap = kInf;
         result.status = "NoSolution";
     }
-
     return result;
+}
+
+} // namespace
+
+SolverResult solve(const ScpInstance &instance, const SolverConfig &config) {
+    SolverRun R(instance, config);
+    if (R.obj_is_integral && R.verbosity >= 2)
+        fprintf(stderr, "Objective coefficients are integral; enabling dual bound tightening\n");
+
+    run_greedy(R);
+    run_root_reductions(R);
+    if (R.wm.nrows == 0)
+        return trivial_result(R);
+
+    solve_root_lp(R);
+    run_post_lp_phase(R);
+    prepare_bnb_model(R);
+
+    const BnbOutcome out = run_branch_and_bound(R);
+    return make_result(R, out);
 }
 
 } // namespace scpsol

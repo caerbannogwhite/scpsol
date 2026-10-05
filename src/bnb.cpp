@@ -1,4 +1,5 @@
 #include "bnb.h"
+#include "compact.h"
 #include "cuts.h"
 #include "preprocessor.h"
 
@@ -9,165 +10,59 @@
 
 namespace scpsol {
 
-ModelReductionResult reduce_base_model(
-    BaseRelaxationModel &base, double incumbent_bound, double tol) {
+namespace {
+
+// Drop the columns with keep[j] == 0 from the base model (matrix, costs,
+// column map and cuts) and return the old->new map.
+ModelReductionResult remove_base_columns(BaseRelaxationModel &base,
+                                         const std::vector<char> &keep) {
     ModelReductionResult result;
-    result.old_to_new.assign(static_cast<size_t>(base.ncols), 0);
+    const int new_ncols = build_column_map(keep, result.old_to_new);
+    result.columns_removed = base.ncols - new_ncols;
+    if (result.columns_removed <= 0) return result;
 
-    std::vector<int> new_to_old;
-    std::vector<int> new_active_to_original;
-    int new_col = 0;
-    for (int old_col = 0; old_col < base.ncols; ++old_col) {
-        if (base.obj[static_cast<size_t>(old_col)] + tol >= incumbent_bound) {
-            result.old_to_new[static_cast<size_t>(old_col)] = -1;
-            ++result.columns_removed;
-        } else {
-            result.old_to_new[static_cast<size_t>(old_col)] = new_col;
-            new_to_old.push_back(old_col);
-            new_active_to_original.push_back(base.active_to_original[static_cast<size_t>(old_col)]);
-            ++new_col;
-        }
-    }
-
-    if (result.columns_removed == 0) return result;
-
-    const int new_ncols = new_col;
-
-    // Rebuild objective
-    std::vector<double> new_obj(static_cast<size_t>(new_ncols));
-    for (int j = 0; j < new_ncols; ++j)
-        new_obj[static_cast<size_t>(j)] = base.obj[static_cast<size_t>(new_to_old[static_cast<size_t>(j)])];
-
-    // Rebuild CSR
-    std::vector<int> new_csr_inds;
-    std::vector<int> new_csr_offs;
-    std::vector<double> new_csr_vals;
-    new_csr_offs.reserve(static_cast<size_t>(base.nrows) + 1);
-    new_csr_offs.push_back(0);
-
-    for (int i = 0; i < base.nrows; ++i) {
-        for (int k = base.csr_offs[static_cast<size_t>(i)]; k < base.csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-            const int old_col = base.csr_inds[static_cast<size_t>(k)];
-            if (old_col >= 0 && old_col < base.ncols) {
-                const int mapped = result.old_to_new[static_cast<size_t>(old_col)];
-                if (mapped >= 0) {
-                    new_csr_inds.push_back(mapped);
-                    new_csr_vals.push_back(base.csr_vals[static_cast<size_t>(k)]);
-                }
-            }
-        }
-        new_csr_offs.push_back(static_cast<int>(new_csr_vals.size()));
-    }
-
+    compact_csr_columns(base.nrows, result.old_to_new, base.csr_inds, base.csr_offs, base.csr_vals);
+    compact_column_vector(result.old_to_new, new_ncols, base.obj);
+    compact_column_vector(result.old_to_new, new_ncols, base.active_to_original);
     base.ncols = new_ncols;
-    base.nnz = static_cast<int>(new_csr_vals.size());
-    base.csr_inds = std::move(new_csr_inds);
-    base.csr_offs = std::move(new_csr_offs);
-    base.csr_vals = std::move(new_csr_vals);
-    base.obj = std::move(new_obj);
-    base.active_to_original = std::move(new_active_to_original);
+    base.nnz = static_cast<int>(base.csr_vals.size());
 
-    // Remap base_cuts
     for (CutConstraint &cut : base.base_cuts) {
         remap_cut_constraint(cut, result.old_to_new);
     }
-
     return result;
+}
+
+} // anonymous namespace
+
+ModelReductionResult reduce_base_model(
+    BaseRelaxationModel &base, double incumbent_bound, double tol) {
+    std::vector<char> keep(static_cast<size_t>(base.ncols), 1);
+    for (int j = 0; j < base.ncols; ++j) {
+        if (base.obj[static_cast<size_t>(j)] + tol >= incumbent_bound)
+            keep[static_cast<size_t>(j)] = 0;
+    }
+    return remove_base_columns(base, keep);
 }
 
 ModelReductionResult reduce_base_model_budget_pruning(
     BaseRelaxationModel &base, double incumbent_bound, double tol,
     double preprocess_time_limit_sec) {
-    ModelReductionResult result;
-    result.old_to_new.assign(static_cast<size_t>(base.ncols), 0);
-
     if (base.nrows <= 0 || base.ncols <= 0 || !std::isfinite(incumbent_bound))
-        return result;
+        return ModelReductionResult{};
 
-    ColumnPreprocessContext ctx;
-    ctx.nrows = base.nrows;
-    ctx.ncols = base.ncols;
-    ctx.costs.assign(base.obj.begin(), base.obj.begin() + base.ncols);
-    ctx.active.assign(static_cast<size_t>(ctx.ncols), 1);
-    ctx.incumbent_bound = incumbent_bound;
-    if (preprocess_time_limit_sec > 0.0) {
-        ctx.deadline = std::chrono::steady_clock::now() +
-                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                           std::chrono::duration<double>(preprocess_time_limit_sec));
-    }
-
-    ctx.rows_by_column.assign(static_cast<size_t>(ctx.ncols), std::vector<int>());
-    for (int i = 0; i < base.nrows; ++i) {
-        for (int k = base.csr_offs[static_cast<size_t>(i)]; k < base.csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-            const int col = base.csr_inds[static_cast<size_t>(k)];
-            if (col >= 0 && col < base.ncols && base.csr_vals[static_cast<size_t>(k)] > tol) {
-                ctx.rows_by_column[static_cast<size_t>(col)].push_back(i);
-            }
-        }
-    }
+    ColumnPreprocessContext ctx = make_column_context(
+        base.nrows, base.ncols, base.csr_inds, base.csr_offs, base.csr_vals, base.obj,
+        tol, preprocess_time_limit_sec, incumbent_bound);
 
     auto rules = make_preprocess_rules("incumbent_budget");
     int removed_by_rules = 0;
     for (const auto &rule : rules) {
         removed_by_rules += rule->apply(ctx, tol);
     }
+    if (removed_by_rules <= 0) return ModelReductionResult{};
 
-    if (removed_by_rules <= 0) return result;
-
-    std::vector<int> new_to_old;
-    std::vector<int> new_active_to_original;
-    int new_col = 0;
-    for (int old_col = 0; old_col < base.ncols; ++old_col) {
-        if (!ctx.active[static_cast<size_t>(old_col)]) {
-            result.old_to_new[static_cast<size_t>(old_col)] = -1;
-            ++result.columns_removed;
-        } else {
-            result.old_to_new[static_cast<size_t>(old_col)] = new_col;
-            new_to_old.push_back(old_col);
-            new_active_to_original.push_back(base.active_to_original[static_cast<size_t>(old_col)]);
-            ++new_col;
-        }
-    }
-
-    const int new_ncols = new_col;
-
-    std::vector<double> new_obj(static_cast<size_t>(new_ncols));
-    for (int j = 0; j < new_ncols; ++j)
-        new_obj[static_cast<size_t>(j)] = base.obj[static_cast<size_t>(new_to_old[static_cast<size_t>(j)])];
-
-    std::vector<int> new_csr_inds;
-    std::vector<int> new_csr_offs;
-    std::vector<double> new_csr_vals;
-    new_csr_offs.reserve(static_cast<size_t>(base.nrows) + 1);
-    new_csr_offs.push_back(0);
-
-    for (int i = 0; i < base.nrows; ++i) {
-        for (int k = base.csr_offs[static_cast<size_t>(i)]; k < base.csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-            const int old_col = base.csr_inds[static_cast<size_t>(k)];
-            if (old_col >= 0 && old_col < base.ncols) {
-                const int mapped = result.old_to_new[static_cast<size_t>(old_col)];
-                if (mapped >= 0) {
-                    new_csr_inds.push_back(mapped);
-                    new_csr_vals.push_back(base.csr_vals[static_cast<size_t>(k)]);
-                }
-            }
-        }
-        new_csr_offs.push_back(static_cast<int>(new_csr_vals.size()));
-    }
-
-    base.ncols = new_ncols;
-    base.nnz = static_cast<int>(new_csr_vals.size());
-    base.csr_inds = std::move(new_csr_inds);
-    base.csr_offs = std::move(new_csr_offs);
-    base.csr_vals = std::move(new_csr_vals);
-    base.obj = std::move(new_obj);
-    base.active_to_original = std::move(new_active_to_original);
-
-    for (CutConstraint &cut : base.base_cuts) {
-        remap_cut_constraint(cut, result.old_to_new);
-    }
-
-    return result;
+    return remove_base_columns(base, ctx.active);
 }
 
 bool remap_branch_node(BranchNodeState &node, const std::vector<int> &old_to_new) {

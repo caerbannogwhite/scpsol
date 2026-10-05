@@ -32,6 +32,15 @@ RowReductionResult row_reduce(
     std::vector<double> &obj, std::vector<int> &active_to_input,
     double tol, double time_limit_sec, int verbosity);
 
+// Build the column-oriented view (rows per column, costs, all-active flags,
+// optional deadline and incumbent bound) that the column rules operate on.
+// A time limit <= 0 means no deadline.
+ColumnPreprocessContext make_column_context(
+    int nrows, int ncols,
+    const std::vector<int> &csr_inds, const std::vector<int> &csr_offs,
+    const std::vector<double> &csr_vals, const std::vector<double> &obj,
+    double tol, double time_limit_sec, double incumbent_bound);
+
 class IColumnPreprocessRule {
 public:
     virtual ~IColumnPreprocessRule() {}

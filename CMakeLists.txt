@@ -22,6 +22,7 @@ add_executable(scpsol
     src/cuts.cpp
     src/balas.cpp
     src/bnb.cpp
+    src/compact.cpp
     src/reliability.cpp
     src/lagrangian.cpp
     src/decomposition.cpp
