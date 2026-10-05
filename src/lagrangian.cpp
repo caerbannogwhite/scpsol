@@ -1,7 +1,9 @@
 #include "lagrangian.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 

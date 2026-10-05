@@ -4,9 +4,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <sstream>
+#include <string>
 
 namespace scpsol {
 

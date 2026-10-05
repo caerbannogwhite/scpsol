@@ -4,7 +4,9 @@
 #include <cctype>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <sstream>
+#include <string>
 
 namespace scpsol {
 

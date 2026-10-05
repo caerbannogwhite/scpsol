@@ -1,7 +1,9 @@
 #include "rins.h"
 #include "solver.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
