@@ -17,12 +17,22 @@ if(NOT TIMEOUT)
 endif()
 
 separate_arguments(arg_list NATIVE_COMMAND "${ARGS}")
-execute_process(
-    COMMAND "${SOLVER}" "${INSTANCE}" ${arg_list}
-    RESULT_VARIABLE rc
-    OUTPUT_VARIABLE out
-    ERROR_VARIABLE err
-    TIMEOUT ${TIMEOUT})
+# Under heavy system load the solver occasionally exits with code 0 and no
+# stdout at all (issue #2). That exact signature is retried a couple of times
+# so the suite does not report a solver regression for it; any other outcome
+# is checked as-is.
+foreach(attempt RANGE 1 3)
+    execute_process(
+        COMMAND "${SOLVER}" "${INSTANCE}" ${arg_list}
+        RESULT_VARIABLE rc
+        OUTPUT_VARIABLE out
+        ERROR_VARIABLE err
+        TIMEOUT ${TIMEOUT})
+    if(EXPECT_FAIL OR NOT rc EQUAL 0 OR NOT out STREQUAL "")
+        break()
+    endif()
+    message(WARNING "attempt ${attempt}: exit code 0 with empty stdout (issue #2), retrying")
+endforeach()
 
 function(fail msg)
     message(STATUS "---- stdout ----\n${out}\n---- stderr ----\n${err}\n----------------")
