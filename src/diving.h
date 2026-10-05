@@ -3,6 +3,7 @@
 
 #include "model.h"
 #include "lp.h"
+#include <string>
 
 namespace scpsol {
 

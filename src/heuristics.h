@@ -3,6 +3,7 @@
 
 #include "model.h"
 #include <memory>
+#include <string>
 
 namespace scpsol {
 
