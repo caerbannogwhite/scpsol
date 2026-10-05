@@ -1,5 +1,6 @@
 #include "preprocessor.h"
 #include "bitset_util.h"
+#include "compact.h"
 
 #include <algorithm>
 #include <cctype>
@@ -353,6 +354,16 @@ public:
     int apply(ColumnPreprocessContext &ctx, double tol) const override {
         if (ctx.nrows <= 0 || ctx.ncols <= 0 || !std::isfinite(ctx.incumbent_bound)) return 0;
 
+        // The budget arithmetic below relies on integer costs: an improving
+        // solution is then at least one unit cheaper than the incumbent, and
+        // "budget < 2" means at most one extra unit-cost column fits. With
+        // fractional costs those shortcuts prune valid columns, so skip the rule.
+        for (int j = 0; j < ctx.ncols; ++j) {
+            if (!ctx.active[static_cast<size_t>(j)]) continue;
+            const double c = ctx.costs[static_cast<size_t>(j)];
+            if (std::fabs(c - std::floor(c + 0.5)) > tol) return 0;
+        }
+
         const double incumbent_floor = std::floor(ctx.incumbent_bound);
 
         struct CostCol { double cost; int col; };
@@ -455,6 +466,33 @@ public:
 };
 
 } // anonymous namespace
+
+ColumnPreprocessContext make_column_context(
+    int nrows, int ncols,
+    const std::vector<int> &csr_inds, const std::vector<int> &csr_offs,
+    const std::vector<double> &csr_vals, const std::vector<double> &obj,
+    double tol, double time_limit_sec, double incumbent_bound) {
+    ColumnPreprocessContext ctx;
+    ctx.nrows = nrows;
+    ctx.ncols = ncols;
+    ctx.costs.assign(obj.begin(), obj.begin() + ncols);
+    ctx.active.assign(static_cast<size_t>(ncols), 1);
+    ctx.incumbent_bound = incumbent_bound;
+    if (time_limit_sec > 0.0) {
+        ctx.deadline = std::chrono::steady_clock::now() +
+                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                           std::chrono::duration<double>(time_limit_sec));
+    }
+    ctx.rows_by_column.assign(static_cast<size_t>(ncols), std::vector<int>());
+    for (int i = 0; i < nrows; ++i) {
+        for (int k = csr_offs[static_cast<size_t>(i)]; k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
+            const int col = csr_inds[static_cast<size_t>(k)];
+            if (col >= 0 && col < ncols && csr_vals[static_cast<size_t>(k)] > tol)
+                ctx.rows_by_column[static_cast<size_t>(col)].push_back(i);
+        }
+    }
+    return ctx;
+}
 
 RowReductionResult row_reduce(
     int &nrows, int &ncols,
@@ -682,43 +720,12 @@ RowReductionResult row_reduce(
         return result;
 
     // Rebuild CSR with active rows and active columns
-    std::vector<int> old_col_to_new(static_cast<size_t>(ncols), -1);
-    std::vector<int> new_active;
-    int new_ncols = 0;
-    for (int j2 = 0; j2 < ncols; ++j2) {
-        if (col_active[static_cast<size_t>(j2)]) {
-            old_col_to_new[static_cast<size_t>(j2)] = new_ncols;
-            new_active.push_back(active_to_input[static_cast<size_t>(j2)]);
-            ++new_ncols;
-        }
-    }
-
-    std::vector<double> new_obj(static_cast<size_t>(new_ncols));
-    for (int j2 = 0; j2 < ncols; ++j2) {
-        const int nj = old_col_to_new[static_cast<size_t>(j2)];
-        if (nj >= 0) new_obj[static_cast<size_t>(nj)] = obj[static_cast<size_t>(j2)];
-    }
-
-    std::vector<int> new_inds, new_offs;
-    std::vector<double> new_vals;
-    new_offs.push_back(0);
-    int new_nrows = 0;
-    for (int i = 0; i < nrows; ++i) {
-        if (!row_active[static_cast<size_t>(i)]) continue;
-        for (int k = csr_offs[static_cast<size_t>(i)];
-             k < csr_offs[static_cast<size_t>(i) + 1]; ++k) {
-            const int c = csr_inds[static_cast<size_t>(k)];
-            if (c >= 0 && c < ncols) {
-                const int nc = old_col_to_new[static_cast<size_t>(c)];
-                if (nc >= 0) {
-                    new_inds.push_back(nc);
-                    new_vals.push_back(csr_vals[static_cast<size_t>(k)]);
-                }
-            }
-        }
-        new_offs.push_back(static_cast<int>(new_vals.size()));
-        ++new_nrows;
-    }
+    std::vector<int> old_col_to_new;
+    const int new_ncols = build_column_map(col_active, old_col_to_new);
+    compact_csr_columns(nrows, old_col_to_new, csr_inds, csr_offs, csr_vals);
+    compact_column_vector(old_col_to_new, new_ncols, obj);
+    compact_column_vector(old_col_to_new, new_ncols, active_to_input);
+    const int new_nrows = compact_csr_rows(row_active, csr_inds, csr_offs, csr_vals);
 
     if (verbosity >= 3) {
         fprintf(stderr, "  Row reduction: %d rows, %d cols -> %d rows, %d cols "
@@ -729,11 +736,6 @@ RowReductionResult row_reduce(
 
     nrows = new_nrows;
     ncols = new_ncols;
-    csr_inds = std::move(new_inds);
-    csr_offs = std::move(new_offs);
-    csr_vals = std::move(new_vals);
-    obj = std::move(new_obj);
-    active_to_input = std::move(new_active);
 
     return result;
 }
